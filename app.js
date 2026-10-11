@@ -1,0 +1,3989 @@
+// ============================================================
+// SMART TRADER — APPLICATION SHELL
+// ------------------------------------------------------------
+// Everything with a side effect lives here: DOM rendering, provider network
+// calls, localStorage, Firebase sync, and the autonomous scheduler. The maths
+// itself comes from lib/engine.js, which is shared verbatim with the
+// server-side worker so unattended analysis can't drift from what's on screen.
+// ============================================================
+import {
+  genData, calcEMA, fmt, parseUtcDatetime, premiumDiscount, downgradeGrade,
+  detectSystemAlert, FRED_INSTRUMENTS, CORRELATION_INSTRUMENTS,
+  FUNDAMENTAL_INSTRUMENTS, pearsonCorrelation, toDailyReturns,
+  computeComposite, PIP_SIZE, QUALITY_FEATURE_NAMES, classifyZone, correlateByDay,
+  trainAdaBoostStumps, buildMetaTrainingSet, META_LIMITS, thinExamples, buildTradePlan, reasoningText, FACTOR_LABELS,
+  patternSignature, computeTunedWeights, runSmcBacktest, setMetaModel,
+  AUTONOMY_DEFAULTS, resolveSignal, autonomyGate, macroContribution,
+  aggregateMacroScore, pctChangeOf, seriesDeltas, latestChangeOf, computeCalibration,
+  computeConditionBreakdown, computeGateAudit, dataInventory, utcDayKey, rollQuota,
+  canSpend, spendQuota, quotaSummary, criticalReserveFor, PAPER_DEFAULTS,
+  openPaperPosition, closePaperPosition, unrealisedPnl, paperAccountSummary, shouldPaperTrade,
+  paperRejectReason,
+  GATE_LABELS, PARTIAL_TP_DEFAULTS, fillPaperPosition,
+  NEWS_WINDOW_DEFAULTS, newsWindowState, newsAlertText, signalsToFlatten, explainMarket,
+  fitMacroModel, macroModelScore, describeMacroModel, alignByDay,
+  mergeSignalLogs, newlyResolvedSignals, newlyArrivedOpenSignals, newlyExpiredSignals,
+  interpretConfidence, confidenceBand, CONFIDENCE_PRACTICAL_MAX, signalLiveness,
+  weekendFlattenState, signalsToFlattenForWeekend, weekendFlattenText,
+  resetPaperAccount, thinPositions, PAPER_HISTORY_SOFT_LIMIT,
+  reconcilePaperBook, isInEra, normaliseEpoch
+} from './lib/engine.js';
+import { emptyKnowledge, recordObservation, assessKnowledge, detectNovelty,
+  describeKnowledge, KNOWLEDGE_DEFAULTS } from './lib/knowledge.js';
+import { auditAnalysis, auditOpenTrades, isMarketOpen, marketClock } from './lib/auditor.js';
+
+const LEARNING_KEY = 'smc-factor-stats-v1';
+let learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
+Object.keys(FACTOR_LABELS).forEach(k => { learningState.factors[k] = { votes: 0, wins: 0 }; });
+
+
+async function loadLearningState() {
+  try {
+    const raw = localStorage.getItem(LEARNING_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      Object.keys(FACTOR_LABELS).forEach(k => { if (!parsed.factors[k]) parsed.factors[k] = { votes: 0, wins: 0 }; });
+      if (!parsed.patterns) parsed.patterns = {};
+      if (!parsed.metaExamples) parsed.metaExamples = [];
+      if (!parsed.metaBacktestExamples) parsed.metaBacktestExamples = [];
+      if (parsed.metaModel === undefined) parsed.metaModel = null;
+      learningState = asPlainObject(parsed);
+      learningState.factors = asPlainObject(learningState.factors);
+      learningState.patterns = asPlainObject(learningState.patterns);
+      learningState.metaExamples = asObjectArray(learningState.metaExamples, ['features']);
+      learningState.metaBacktestExamples = asObjectArray(learningState.metaBacktestExamples, ['features']);
+      if (!Array.isArray(learningState.metaModel)) learningState.metaModel = null;
+      if (!isFinite(learningState.totalLogged)) learningState.totalLogged = 0;
+      setMetaModel(learningState.metaModel);
+    }
+  } catch (e) { /* nothing stored yet */ }
+  renderLearningTable();
+  renderPatternTable();
+}
+async function saveLearningState() {
+  try { localStorage.setItem(LEARNING_KEY, JSON.stringify(learningState)); } catch (e) { /* storage unavailable */ }
+  if (fbReady && fbAuth.currentUser) schedulePushCloudState(fbAuth.currentUser.uid);
+}
+function recordOutcome(dir, factors, won) {
+  const dirSign = dir === 'BUY' ? 1 : -1;
+  Object.keys(FACTOR_LABELS).forEach(k => {
+    const v = factors[k];
+    if (v && Math.sign(v) === dirSign) {
+      learningState.factors[k].votes++;
+      if (won) learningState.factors[k].wins++;
+    }
+  });
+  const sig = patternSignature(dir, factors);
+  if (!learningState.patterns[sig]) learningState.patterns[sig] = { votes: 0, wins: 0 };
+  learningState.patterns[sig].votes++;
+  if (won) learningState.patterns[sig].wins++;
+  learningState.totalLogged++;
+  saveLearningState();
+  renderLearningTable();
+  renderPatternTable();
+}
+function renderPatternTable() {
+  const list = document.getElementById('patternList');
+  if (!list) return;
+  const entries = Object.keys(learningState.patterns)
+    .map(sig => ({ sig, v: learningState.patterns[sig] }))
+    .filter(e => e.v.votes >= 3)
+    .sort((a, b) => (b.v.wins / b.v.votes) - (a.v.wins / a.v.votes));
+  if (!entries.length) { list.innerHTML = '<div class="zone-empty">No patterns with 3+ occurrences yet — keep backtesting or logging live signals.</div>'; return; }
+  list.innerHTML = entries.slice(0, 6).map(e => {
+    const wr = (e.v.wins / e.v.votes * 100);
+    const cls = wr >= 55 ? 'fpos' : wr <= 45 ? 'fneg' : 'fneu';
+    const niceName = e.sig === 'none' ? 'No confluence' : e.sig.split('+').map(k => FACTOR_LABELS[k] || k).join(' + ');
+    return '<div class="zone-item"><span style="max-width:70%;">' + niceName + ' <span style="color:#454a56;">(' + e.v.votes + 'x)</span></span><span class="mono ' + cls + '">' + wr.toFixed(0) + '%</span></div>';
+  }).join('');
+}
+const KB_MIN_TRADES = 15;
+function applyKnowledgeBaseWeights() {
+  const kbStatus = document.getElementById('kbStatus');
+  if (learningState.totalLogged < KB_MIN_TRADES) {
+    kbStatus.textContent = 'Knowledge base: ' + learningState.totalLogged + '/' + KB_MIN_TRADES + ' logged outcomes — not enough yet to auto-apply. Backtest on Twelve Data to build it up; using your manually-set weights until then.';
+    return false;
+  }
+  const idByKey = {}; weightIds.forEach(id => { idByKey[weightKeys[id]] = id; });
+  Object.keys(FACTOR_LABELS).forEach(k => {
+    const s = learningState.factors[k];
+    if (s.votes >= 5) {
+      const wr = s.wins / s.votes;
+      const newWeight = Math.max(2, Math.min(30, Math.round(wr * 100 * 0.4)));
+      const el = document.getElementById(idByKey[k]);
+      if (el) { el.value = newWeight; document.getElementById(idByKey[k] + 'V').textContent = newWeight; }
+    }
+  });
+  kbStatus.textContent = 'Knowledge base: trained on ' + learningState.totalLogged + ' logged outcomes — weights below were auto-applied from this history and now drive live analysis on whichever provider is connected.';
+  return true;
+}
+function renderLearningTable() {
+  const status = document.getElementById('learningStatus');
+  status.textContent = learningState.totalLogged
+    ? 'Learned from ' + learningState.totalLogged + ' logged trade outcomes (backtests + manually marked live signals), persisted in this browser.'
+    : 'No trade outcomes logged yet — run a backtest or mark live signals won/lost below to start building history.';
+  const weights = getWeights();
+  const table = document.getElementById('learningTable');
+  table.innerHTML = Object.keys(FACTOR_LABELS).map(k => {
+    const s = learningState.factors[k];
+    const wr = s.votes ? (s.wins / s.votes * 100) : null;
+    const cls = wr == null ? 'fneu' : wr >= 55 ? 'fpos' : wr <= 45 ? 'fneg' : 'fneu';
+    const wrTxt = wr == null ? 'no data' : wr.toFixed(0) + '% (' + s.votes + ')';
+    return '<tr><td>' + FACTOR_LABELS[k] + '</td><td class="' + cls + '">' + wrTxt + ' · w=' + weights[k] + '</td></tr>';
+  }).join('');
+}
+document.getElementById('autoTuneBtn').addEventListener('click', () => {
+  applyKnowledgeBaseWeights();
+  refreshAll(); renderLearningTable();
+});
+document.getElementById('resetLearning').addEventListener('click', async () => {
+  learningState = { factors: {}, patterns: {}, totalLogged: 0, metaExamples: [], metaModel: null };
+  Object.keys(FACTOR_LABELS).forEach(k => { learningState.factors[k] = { votes: 0, wins: 0 }; });
+  setMetaModel(null);
+  await saveLearningState();
+  renderLearningTable();
+  renderPatternTable();
+  applyKnowledgeBaseWeights();
+});
+// NOTE: startup restore of learning state deliberately does NOT happen here.
+// loadLearningState() calls renderLearningTable() -> getWeights(), which reads the
+// weightIds/weightKeys consts declared further down this file. Running it at this
+// point throws a temporal-dead-zone ReferenceError, which used to abort the whole
+// restore chain silently — so saved learning weights were never applied on load.
+// The real call now lives in bootstrap() at the end of the file.
+
+const SIGNAL_LOG_KEY = 'smc-signal-log-v1';
+let signalLog = [];
+
+// The setups the gate turned down, tracked and resolved exactly like real ones.
+// This is the ledger no trading journal has: without it, "should I loosen my
+// filter?" can only ever be answered by feel. Capped, and never counted as a
+// trade — these are measurements, not signals.
+const SHADOW_LOG_KEY = 'smc-shadow-log-v1';
+const SHADOW_LOG_MAX = 250;
+let shadowLog = [];
+async function loadShadowLog() {
+  try {
+    const raw = localStorage.getItem(SHADOW_LOG_KEY);
+    if (raw) shadowLog = asObjectArray(JSON.parse(raw), ['id']);
+  } catch (e) { shadowLog = []; }
+}
+async function saveShadowLog() {
+  try { localStorage.setItem(SHADOW_LOG_KEY, JSON.stringify(shadowLog.slice(0, SHADOW_LOG_MAX))); }
+  catch (e) { /* storage unavailable */ }
+}
+function addShadowSignal(result, plan, declineReason) {
+  if (!result || result.direction === 'HOLD' || !plan) return;
+  if (!isFinite(plan.entry) || !isFinite(plan.sl) || !isFinite(plan.tp) || plan.rr <= 0) return;
+  // One shadow per bar at most, so a 15-minute cadence doesn't log the same
+  // standing setup dozens of times and swamp the comparison.
+  const lastBarTime = liveData.length ? liveData[liveData.length - 1].time : null;
+  if (shadowLog.length && shadowLog[0].barTime === lastBarTime) return;
+  shadowLog.unshift({
+    id: 'sh-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+    dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
+    entryType: plan.entryType, confidence: result.confidence,
+    session: result.sessionInfo ? result.sessionInfo.session : null,
+    regime: result.regimeInfo ? result.regimeInfo.regime : null,
+    grade: result.fusion ? downgradeGrade(result.fusion.grade, plan.metaScore || 0) : null,
+    metaScore: plan.metaScore || 0,
+    declineReason: declineReason || null,
+    barTime: lastBarTime,
+    time: new Date().toISOString(), status: plan.entryType === 'market' ? 'open' : 'pending'
+  });
+  shadowLog = shadowLog.slice(0, SHADOW_LOG_MAX);
+  saveShadowLog();
+}
+async function loadSignalLog() {
+  try {
+    const raw = localStorage.getItem(SIGNAL_LOG_KEY);
+    if (raw) signalLog = asObjectArray(JSON.parse(raw), ['id']);
+  } catch (e) { signalLog = []; }
+  renderSignalLog();
+}
+// Newest-first, so trimming takes from the TAIL. slice(-N) here kept the OLDEST
+// N instead, which meant that once the log filled, every newly logged signal was
+// dropped on the very next save — it could never be resolved, so the knowledge
+// base stopped accumulating entirely at the cap.
+const SIGNAL_LOG_MAX = 600;
+async function saveSignalLog() {
+  if (signalLog.length > SIGNAL_LOG_MAX) signalLog = signalLog.slice(0, SIGNAL_LOG_MAX);
+  try { localStorage.setItem(SIGNAL_LOG_KEY, JSON.stringify(signalLog)); } catch (e) { /* storage unavailable */ }
+  if (fbReady && fbAuth.currentUser) schedulePushCloudState(fbAuth.currentUser.uid);
+}
+function addSignalToLog(result, plan, origin) {
+  const sig = {
+    id: Date.now() + '-' + Math.random().toString(36).slice(2, 7),
+    dir: result.direction, entry: plan.entry, sl: plan.sl, tp: plan.tp,
+    confidence: result.confidence, factors: Object.assign({}, result.factors),
+    session: result.sessionInfo ? result.sessionInfo.session : null,
+    regime: result.regimeInfo ? result.regimeInfo.regime : null,
+    entryType: plan.entryType,
+    grade: result.fusion ? downgradeGrade(result.fusion.grade, plan.metaScore || 0) : null,
+    qualityFeatures: plan.qualityFeatures || null, metaScore: plan.metaScore || 0,
+    reason: reasoningText(result, plan),
+    time: new Date().toISOString(), status: 'pending', mistake: null,
+    // Where the trade came from. 'auto' is the autonomous heartbeat in this tab,
+    // 'worker' arrives from the server tick, 'manual' is the Generate button.
+    // Without this the log could not say which trades the system took by itself.
+    source: origin || 'manual'
+  };
+  signalLog.unshift(sig);
+  saveSignalLog();
+  renderSignalLog();
+  paperOpenForSignal(sig);
+}
+// Single place where a signal turns into training data, whether a human clicked
+// win/loss or the autonomous resolver read it off the candles. Keeping one path
+// means unattended outcomes feed the knowledge base exactly like manual ones.
+function applySignalOutcome(sig, won, opts) {
+  opts = opts || {};
+  if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return false;
+  sig.status = won ? 'won' : 'lost';
+  sig.resolvedAt = new Date().toISOString();
+  sig.resolvedBy = opts.auto ? 'auto' : 'manual';
+  if (opts.exitPrice != null) sig.exitPrice = opts.exitPrice;
+  if (opts.ambiguousBar) sig.ambiguousBar = true;
+  if (opts.partial) sig.partial = true;
+  if (opts.mistakeNote) sig.mistake = opts.mistakeNote;
+  // Feed the factor stats and the meta-labeler's training set. Retraining itself
+  // happens on the next backtest cycle, consistent with the rest of the
+  // self-learning loop, rather than retraining on every single resolution.
+  learnFromResolvedSignal(sig);
+  paperCloseForSignal(sig.id, won ? 'won' : 'lost', opts.exitPrice);
+  return true;
+}
+// Learning is applied exactly once per signal, wherever the outcome came from.
+// The flag lives on the signal itself rather than in a side list so it survives
+// a reload, a cloud pull and a worker merge — the three ways the same resolved
+// trade can come back around.
+// Train on a bounded sample of a store that is not bounded to match.
+//
+// Boosting costs roughly quadratic time here — 1.5s at 2,000 examples, 50s at
+// 20,000 — so the training set is capped for speed while the record keeps
+// everything. Live examples claim the slots first; backtest data only fills
+// what live has not.
+// Say what the model was actually trained on. "500 labeled trades" hid the fact
+// that nearly all of them were synthetic.
+function metaTrainingSummary() {
+  const live = (learningState.metaExamples || []).length;
+  const bt = (learningState.metaBacktestExamples || []).length;
+  const set = lastMetaTraining;
+  const stumps = learningState.metaModel ? learningState.metaModel.length : 0;
+  const used = set
+    ? set.liveUsed + ' live + ' + set.backtestUsed + ' backtest'
+    : 'all available';
+  const held = live > (set ? set.liveUsed : 0)
+    ? ' A training pass samples ' + META_LIMITS.trainingSet + ' of them for speed — weighted to recent ' +
+      'history, with the rest spread across everything older — so the whole record keeps informing the model.'
+    : '';
+  return 'Trained on ' + used + ' examples, ' + stumps + ' stumps. ' +
+    'Holding ' + live + ' live outcomes and ' + bt + ' backtest examples. ' +
+    'There is no point at which this stops accumulating: live outcomes have their own budget, are never ' +
+    'evicted by backtest data, and once the store grows large the oldest history is kept at lower ' +
+    'resolution rather than discarded — so the record always reaches back to the first trade.' + held;
+}
+
+let lastMetaTraining = null;
+let metaRetrainTimer = null;
+
+function retrainMetaLabeler() {
+  const set = buildMetaTrainingSet(learningState.metaExamples, learningState.metaBacktestExamples);
+  lastMetaTraining = set;
+  learningState.metaModel = set.examples.length ? trainAdaBoostStumps(set.examples, 20) : null;
+  setMetaModel(learningState.metaModel);
+  return set;
+}
+
+// Coalesce retraining. A training pass costs about 1.5s at the 2,000-example
+// cap, and catch-up can resolve a dozen signals in one go — retraining on each
+// would lock the page for twenty seconds to reach a model that one pass at the
+// end produces identically.
+function scheduleMetaRetrain() {
+  if (metaRetrainTimer) clearTimeout(metaRetrainTimer);
+  metaRetrainTimer = setTimeout(() => {
+    metaRetrainTimer = null;
+    try { retrainMetaLabeler(); saveLearningState(); }
+    catch (e) { /* the next resolution will try again */ }
+  }, 1200);
+}
+
+function learnFromResolvedSignal(sig) {
+  if (!sig || sig.learned) return false;
+  if (sig.status !== 'won' && sig.status !== 'lost') return false;
+  const won = sig.status === 'won';
+  recordOutcome(sig.dir, sig.factors || {}, won);
+  if (sig.qualityFeatures) {
+    // Live outcomes are scarce and irreplaceable, and they get their own budget.
+    // They used to share a 500-slot window with backtest examples arriving ten
+    // times faster, so a real result survived days at best.
+    learningState.metaExamples = (learningState.metaExamples || [])
+      .concat([{ features: sig.qualityFeatures, label: won ? 1 : -1 }]);
+    // Thinned, never truncated: the record keeps spanning every day it has run.
+    learningState.metaExamples = thinExamples(learningState.metaExamples, META_LIMITS.liveSoftLimit);
+    scheduleMetaRetrain();
+    saveLearningState();
+  }
+  sig.learned = true;
+  return true;
+}
+
+function markSignalResult(id, won, mistakeNote) {
+  const sig = signalLog.find(s => s.id === id);
+  if (!applySignalOutcome(sig, won, { mistakeNote: mistakeNote, auto: false })) return;
+  saveSignalLog();
+  renderSignalLog();
+  renderJournalInsights();
+  renderAnalysisQuality();
+  renderDataInventory();
+}
+// Fold signals from another source — the background worker, or the cloud copy
+// of this account — into the local log.
+//
+// This is the fix for the log only ever knowing about trades taken while the
+// tab was open. The worker takes trades unattended and grades them server-side;
+// none of that was reaching the log, so an autonomous trade was invisible and
+// its win or loss unknowable from the UI. Everything the merge learns about
+// gets the same treatment a locally-taken trade gets: a paper position, a
+// learning update, a rendered row.
+// Snapshot listeners are registered while the module evaluates, but the local
+// log is restored asynchronously in bootstrap(). A worker snapshot arriving in
+// that window would merge into an empty log and then be overwritten by the
+// restore — the trade would flicker into the UI and vanish. Buffer until the
+// local state is actually loaded.
+let signalsBootstrapped = false;
+const pendingIngest = [];
+
+function flushPendingIngest() {
+  signalsBootstrapped = true;
+  while (pendingIngest.length) {
+    const job = pendingIngest.shift();
+    ingestSignals(job.incoming, job.label);
+  }
+}
+
+function ingestSignals(incoming, label) {
+  if (!Array.isArray(incoming) || !incoming.length) return 0;
+  if (!signalsBootstrapped) { pendingIngest.push({ incoming, label }); return 0; }
+  const before = signalLog;
+  const merged = mergeSignalLogs(before, incoming, SIGNAL_LOG_MAX);
+  const arrived = newlyArrivedOpenSignals(before, merged);
+  const resolved = newlyResolvedSignals(before, merged);
+  const expired = newlyExpiredSignals(before, merged);
+  const beforeById = new Map(before.map(s => [s.id, s]));
+  signalLog = merged;
+
+  // A trade that turned up already live needs a position, or the paper account
+  // silently ignores everything the system did while this tab was closed.
+  arrived.forEach(sig => paperOpenForSignal(sig));
+
+  // A resting order the worker saw fill.
+  merged.forEach(sig => {
+    if (sig.status !== 'open') return;
+    const was = beforeById.get(sig.id);
+    if (was && was.status === 'pending') paperFillForSignal(sig.id, sig.filledAt || new Date().toISOString());
+  });
+
+  // Killed by the worker: cancel the paper order. An expired signal has no
+  // outcome, so this closes the position without booking a win or a loss, and
+  // stops a dead order holding a slot the gate counts against new signals.
+  expired.forEach(sig => paperCloseForSignal(sig.id, 'expired'));
+
+  resolved.forEach(sig => {
+    // Taken and graded entirely between two merges — the position never existed
+    // here. Open it so the account books the trade, then close it. Sizing uses
+    // the balance now rather than at entry, which is an approximation, but a
+    // recorded approximate trade beats an autonomous trade the account never
+    // hears about.
+    if (paper.enabled && !paper.positions.some(p => p.signalId === sig.id)) {
+      paperOpenForSignal(Object.assign({}, sig, { entryType: 'market' }));
+    }
+    paperCloseForSignal(sig.id, sig.status, sig.exitPrice);
+    learnFromResolvedSignal(sig);
+  });
+
+  const changed = arrived.length || resolved.length || expired.length || merged.length !== before.length;
+  if (changed) {
+    saveSignalLog();
+    renderSignalLog();
+    renderJournalInsights();
+    renderAnalysisQuality();
+    renderDataInventory();
+    renderAutonomyStats();
+  }
+  if ((arrived.length || resolved.length || expired.length) && label) {
+    const parts = [];
+    if (arrived.length) parts.push(arrived.length + ' new trade(s)');
+    if (resolved.length) parts.push(resolved.length + ' resolved');
+    if (expired.length) parts.push(expired.length + ' killed as stale');
+    setWorkerLogNote(label + ': ' + parts.join(', ') + '.');
+  }
+  return arrived.length + resolved.length + expired.length;
+}
+
+function setWorkerLogNote(text) {
+  const el = document.getElementById('workerLogNote');
+  if (el) el.textContent = text || '';
+}
+
+function renderJournalInsights() {
+  const el = document.getElementById('journalInsights');
+  if (!el) return;
+  // 'open' and 'expired' are not outcomes — only a real win or loss is a data point.
+  const resolved = signalLog.filter(s => s.status === 'won' || s.status === 'lost');
+  if (resolved.length < 5) { el.textContent = 'Log at least 5 resolved trades to see personalized insights (' + resolved.length + '/5 so far).'; return; }
+  const bySession = {};
+  resolved.forEach(s => {
+    const k = s.session || 'Unknown';
+    if (!bySession[k]) bySession[k] = { wins: 0, total: 0 };
+    bySession[k].total++; if (s.status === 'won') bySession[k].wins++;
+  });
+  const lines = Object.keys(bySession).map(k => {
+    const s = bySession[k]; const wr = (s.wins / s.total * 100).toFixed(0);
+    return k + ': ' + wr + '% (' + s.total + ' trades)';
+  });
+  const mistakes = resolved.filter(s => s.mistake).length;
+  el.innerHTML = 'By session — ' + lines.join(' · ') + (mistakes ? '<br>' + mistakes + ' loss(es) have a logged mistake note — check the log below for patterns.' : '');
+}
+// The same band reading as the signal panel, applied to the log so a column of
+// bare percentages reads as high/mid/low FOR THIS ENGINE rather than against an
+// imaginary 0-100 scale.
+function confidenceBandColour(v) {
+  const band = confidenceBand(v, signalLog);
+  return band.key === 'high' ? '#3ecf8e' : band.key === 'mid' ? '#e8c37a' : '#9298a5';
+}
+function confidenceBandTitle(v) {
+  const band = confidenceBand(v, signalLog);
+  return v + '% — ' + band.label + '. This engine\'s realistic ceiling is about '
+    + CONFIDENCE_PRACTICAL_MAX + '%, so read it against that, not against 100.';
+}
+
+const SIGNAL_ORIGIN_LABELS = {
+  manual: '✋ manual',
+  auto: '⚙ auto',
+  worker: '☁ worker'
+};
+
+const LIVENESS_TONES = { live: '#3ecf8e', warn: '#ffa726', bad: '#ef4d5f', good: '#3ecf8e', idle: '#5c6270' };
+
+// A chip saying whether the trade is still working or effectively dead, with
+// the time it has left and how far it has travelled. Only for trades that are
+// still live — a closed one already shows its outcome.
+function livenessTagHtml(life) {
+  if (!life || (life.state !== 'resting' && life.state !== 'running')) return '';
+  const colour = LIVENESS_TONES[life.tone] || LIVENESS_TONES.idle;
+  const dot = life.tone === 'live' ? '●' : life.tone === 'warn' ? '◐' : '○';
+  return '<span class="mono" title="' + escapeAttr(life.detail || '') + '" style="font-size:9px;margin-left:6px;color:'
+    + colour + ';">' + dot + ' ' + escapeAttr(life.label) + '</span>';
+}
+
+function escapeAttr(t) {
+  return String(t == null ? '' : t).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function paperPositionFor(signalId) {
+  return paper.positions.find(p => p.signalId === signalId) || null;
+}
+
+// The paper account's view of this signal, shown on the log row itself. Without
+// it the log and the paper panel were two separate lists with no way to tell
+// which row corresponded to which trade.
+function paperTagHtml(pos) {
+  if (!pos) return '';
+  const wrap = (colour, text) => '<span class="mono" style="font-size:9px;margin-left:6px;color:' + colour + ';">' + text + '</span>';
+  if (pos.status === 'pending') return wrap('#9298a5', 'paper: resting');
+  if (pos.status === 'cancelled') return wrap('#454a56', 'paper: cancelled');
+  if (pos.status === 'open') {
+    const fl = unrealisedPnl(pos, currentMarkPrice());
+    if (!isFinite(fl)) return wrap('#9298a5', 'paper: open');
+    return wrap(fl >= 0 ? '#3ecf8e' : '#ef4d5f', 'paper: ' + (fl >= 0 ? '+' : '-') + '$' + Math.abs(fl).toFixed(2) + ' floating');
+  }
+  if (pos.status === 'closed') {
+    const p = pos.pnl || 0;
+    const r = pos.rMultiple != null ? ' (' + (pos.rMultiple >= 0 ? '+' : '') + pos.rMultiple.toFixed(2) + 'R)' : '';
+    return wrap(p >= 0 ? '#3ecf8e' : '#ef4d5f', 'paper: ' + (p >= 0 ? '+' : '-') + '$' + Math.abs(p).toFixed(2) + r);
+  }
+  return '';
+}
+
+// Ages only mean something if they move. Without this the chip freezes at
+// whatever it read when the log was last drawn, which for a quiet market could
+// be hours — and a stale "alive" is exactly the thing being fixed.
+let livenessTimer = null;
+function startLivenessTicker() {
+  if (livenessTimer) clearInterval(livenessTimer);
+  livenessTimer = setInterval(() => {
+    if (signalLog.some(s => s.status === 'pending' || s.status === 'open')) {
+      renderSignalLog();
+      renderAutonomyStats();
+    }
+  }, 60000);
+}
+
+function vintageHtml(t) {
+  if (!t) return '';
+  const d = new Date(t);
+  if (!isFinite(d.getTime())) return '';
+  const days = (Date.now() - d.getTime()) / 86400000;
+  const colour = days > 120 ? '#ef4d5f' : days > 45 ? '#ffa726' : '#454a56';
+  const txt = d.toLocaleDateString([], { month: 'short', year: 'numeric' });
+  return ' <span style="color:' + colour + ';font-size:9px;" title="Newest observation in this series. '
+    + Math.round(days) + ' day(s) old.">(' + txt + ')</span>';
+}
+
+function renderSignalLog() {
+  const log = document.getElementById('tradeLog');
+  if (!signalLog.length) { log.innerHTML = '<div class="log-empty">No signals generated yet.</div>'; return; }
+  log.innerHTML = '';
+  signalLog.slice(0, 15).forEach(sig => {
+    const item = document.createElement('div'); item.className = 'log-item'; item.style.flexWrap = 'wrap';
+    const timeTxt = new Date(sig.time).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    const gradeTxt = sig.grade ? ' [' + sig.grade + ']' : '';
+    const sessionTxt = sig.session ? ' · ' + sig.session : '';
+    const originTxt = SIGNAL_ORIGIN_LABELS[sig.source] || SIGNAL_ORIGIN_LABELS.manual;
+    const pos = paperPositionFor(sig.id);
+    // "awaiting entry" and "filled" are true of a trade placed a minute ago and
+    // of one that has been sitting for eleven hours about to be culled. The
+    // liveness chip is the difference between those two.
+    // No price on the simulated feed: an R reading computed off generated
+    // candles is a made-up number wearing a real one's clothes. The clock half
+    // of the chip is still true either way.
+    const life = signalLiveness(sig, autonomyConfig(),
+      { price: dataMode === 'live' ? currentMarkPrice() : null });
+    item.innerHTML = '<span class="dirtag ' + sig.dir + '">' + sig.dir + gradeTxt + '</span><span class="mono">$' + fmt(sig.entry) + '</span><span class="mono" style="color:' + confidenceBandColour(sig.confidence) + ';" title="' + escapeAttr(confidenceBandTitle(sig.confidence)) + '">' + sig.confidence + '%</span><span style="color:#5c6270">' + timeTxt + sessionTxt + '</span>'
+      + '<span style="font-size:9px;color:#5c6270;border:1px solid #2a2f3a;border-radius:4px;padding:1px 5px;margin-left:6px;">' + originTxt + '</span>'
+      + livenessTagHtml(life)
+      + paperTagHtml(pos);
+    const wrap = document.createElement('span');
+    // An autonomous trade grades itself off the candles, so the manual buttons
+    // are an override rather than the only way an outcome is ever recorded.
+    // They stay available — a human can still overrule the resolver — but the
+    // row now says plainly that nobody has to press anything.
+    if (sig.status === 'pending' || sig.status === 'open') {
+      const wonBtn = document.createElement('button'); wonBtn.textContent = 'Won'; wonBtn.style.cssText = 'background:#123326;color:#3ecf8e;border:1px solid #1e4030;border-radius:5px;font-size:10px;padding:2px 7px;margin-left:6px;cursor:pointer;';
+      const lostBtn = document.createElement('button'); lostBtn.textContent = 'Lost'; lostBtn.style.cssText = 'background:#32161a;color:#ef4d5f;border:1px solid #401e22;border-radius:5px;font-size:10px;padding:2px 7px;margin-left:4px;cursor:pointer;';
+      wonBtn.addEventListener('click', () => markSignalResult(sig.id, true));
+      lostBtn.addEventListener('click', () => {
+        const note = window.prompt('Optional: what went wrong with this trade? (helps build your journal — leave blank to skip)');
+        markSignalResult(sig.id, false, note || null);
+      });
+      wrap.appendChild(wonBtn); wrap.appendChild(lostBtn);
+      if (sig.source && sig.source !== 'manual') {
+        const note = document.createElement('span');
+        note.style.cssText = 'font-size:9px;color:#454a56;margin-left:6px;';
+        note.textContent = 'self-grading';
+        note.title = 'The system is watching this trade against live candles and will mark it won or lost by itself. The buttons are a manual override.';
+        wrap.appendChild(note);
+      }
+    } else {
+      const tag = document.createElement('span');
+      const colour = sig.status === 'won' ? '#3ecf8e' : sig.status === 'expired' ? '#9298a5' : '#ef4d5f';
+      tag.style.cssText = 'font-size:10px;margin-left:6px;color:' + colour + ';';
+      const auto = sig.resolvedBy === 'worker' ? ' (worker)' : sig.resolvedBy === 'auto' ? ' (auto)' : '';
+      if (sig.status === 'won') tag.textContent = '✓ won' + (sig.partial ? ' (partial)' : '') + auto;
+      else if (sig.status === 'expired') {
+        tag.textContent = (sig.killSwitch ? '⊘ killed' : '– expired') + (sig.expiryReason ? ' · ' + sig.expiryReason : '');
+        tag.title = 'Not counted as a win or a loss. An expired trade has no outcome, so it is never used as training data.';
+      }
+      else tag.textContent = '✗ lost' + auto + (sig.mistake ? ' — ' + sig.mistake : '');
+      wrap.appendChild(tag);
+    }
+    item.appendChild(wrap);
+    log.appendChild(item);
+  });
+  renderJournalInsights();
+}
+// Restored from bootstrap() at the end of the file, for the same ordering reason
+// as the learning state above.
+
+// ============================================================
+// FIREBASE CLOUD SYNC (optional — learning knowledge base + signal log only, never API keys)
+// ============================================================
+// Firebase project: smart-trader-36ae2. Cloud sync activates automatically once fbReady is true below.
+const firebaseConfig = {
+  apiKey: "AIzaSyB90GIn_PwePfdwQ-_yOMoaTOx9EWK6yQ4",
+  authDomain: "smart-trader-36ae2.firebaseapp.com",
+  projectId: "smart-trader-36ae2",
+  storageBucket: "smart-trader-36ae2.firebasestorage.app",
+  messagingSenderId: "649750236079",
+  appId: "1:649750236079:web:1e530088f7ef5959f6fd5a"
+};
+let fbAuth = null, fbDb = null, fbReady = false;
+try {
+  if (firebaseConfig.apiKey && firebaseConfig.apiKey !== "YOUR_API_KEY" && typeof firebase !== 'undefined') {
+    firebase.initializeApp(firebaseConfig);
+    fbAuth = firebase.auth();
+    fbDb = firebase.firestore();
+    fbReady = true;
+  }
+} catch (e) { console.warn('Firebase not configured:', e.message); }
+
+function updateSyncUI(user) {
+  const status = document.getElementById('syncStatus');
+  const outPanel = document.getElementById('signedOutPanel');
+  const inPanel = document.getElementById('signedInPanel');
+  if (!status) return;
+  if (!fbReady) { status.textContent = 'Cloud sync not configured yet.'; return; }
+  if (user) {
+    status.textContent = 'Synced as ' + user.email;
+    document.getElementById('signedInEmail').textContent = user.email;
+    outPanel.classList.add('hidden'); inPanel.classList.remove('hidden');
+  } else {
+    status.textContent = 'Not signed in — learning stays on this device only.';
+    outPanel.classList.remove('hidden'); inPanel.classList.add('hidden');
+  }
+}
+
+async function pullCloudState(uid) {
+  try {
+    const doc = await fbDb.collection('users').doc(uid).get();
+    if (doc.exists) {
+      const data = doc.data();
+      if (data.learningState) {
+        const parsed = data.learningState;
+        Object.keys(FACTOR_LABELS).forEach(k => { if (!parsed.factors[k]) parsed.factors[k] = { votes: 0, wins: 0 }; });
+        if (!parsed.patterns) parsed.patterns = {};
+        if (!parsed.metaExamples) parsed.metaExamples = [];
+      if (!parsed.metaBacktestExamples) parsed.metaBacktestExamples = [];
+        if (parsed.metaModel === undefined) parsed.metaModel = null;
+        learningState = parsed;
+        setMetaModel(learningState.metaModel);
+      }
+      // Merge rather than assign. A wholesale replace would drop every signal
+      // the background worker had contributed since the last push, including
+      // trades this device has already booked in the paper account.
+      if (data.signalLog) ingestSignals(data.signalLog, 'Cloud sync');
+    } else {
+      // First sync for this account — seed the cloud with whatever's currently on this device.
+      await pushCloudState(uid);
+    }
+  } catch (e) { console.warn('Cloud pull failed:', e.message); }
+}
+// Cloud sync is debounced, trimmed, and reports its own failures.
+//
+// It used to fire on every saveSignalLog() AND every saveLearningState(), so
+// resolving ten signals during catch-up produced eleven full-document writes in
+// a burst. Each carried the whole log — around 530KB against Firestore's hard
+// 1MB per-document ceiling — and a failure was a console.warn nobody would ever
+// read. Cross-device learning could stop permanently and look exactly like
+// working.
+let cloudPushTimer = null;
+let cloudPushPending = false;
+
+function schedulePushCloudState(uid) {
+  cloudPushPending = true;
+  if (cloudPushTimer) clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(() => { cloudPushTimer = null; pushCloudState(uid); }, 3000);
+}
+
+// The reason text is a rendered sentence, regenerable from the signal's own
+// fields, and it is roughly 40% of the payload. It stays local and is stripped
+// from what goes to the cloud.
+function cloudPayload() {
+  // Firestore caps a document at 1MB and this one already carries the signal
+  // log. The full live store can reach ~280KB on its own and the backtest store
+  // is regenerable on any device, so what goes to the cloud is the recent live
+  // history only — enough to carry a trained model across devices without
+  // risking the write. Nothing is dropped locally.
+  const CLOUD_LIVE_EXAMPLES = 1500;
+  const trimmedLearning = Object.assign({}, learningState, {
+    metaExamples: (learningState.metaExamples || []).slice(-CLOUD_LIVE_EXAMPLES),
+    metaBacktestExamples: []
+  });
+  return {
+    learningState: trimmedLearning,
+    signalLog: signalLog.map(({ reason, ...rest }) => rest),
+    updatedAt: Date.now()
+  };
+}
+
+function setSyncNote(text, isError) {
+  const el = document.getElementById('syncStatus');
+  if (!el) return;
+  el.textContent = text;
+  el.style.color = isError ? '#ef4d5f' : '';
+}
+
+async function pushCloudState(uid) {
+  cloudPushPending = false;
+  const payload = cloudPayload();
+  const bytes = JSON.stringify(payload).length;
+  // Firestore rejects documents over 1MB outright. Refusing early with a
+  // visible message beats a rejected write that only reaches the console.
+  if (bytes > 900000) {
+    setSyncNote('Cloud sync paused — local history is ' + Math.round(bytes / 1024)
+      + 'KB, near Firestore\'s 1MB document limit. Learning continues on this device.', true);
+    return;
+  }
+  try {
+    await fbDb.collection('users').doc(uid).set(payload, { merge: true });
+    const user = fbAuth && fbAuth.currentUser;
+    if (user) setSyncNote('Synced as ' + user.email + ' · ' + Math.round(bytes / 1024) + 'KB', false);
+  } catch (e) {
+    setSyncNote('Cloud sync failed: ' + (e && e.message ? e.message : 'unknown') + ' — learning continues locally.', true);
+  }
+}
+
+if (fbReady) {
+  fbAuth.onAuthStateChanged(async (user) => {
+    updateSyncUI(user);
+    if (user) {
+      await pullCloudState(user.uid);
+      renderLearningTable(); renderPatternTable(); renderSignalLog();
+      applyKnowledgeBaseWeights();
+      if (typeof refreshAll === 'function') refreshAll();
+    }
+  });
+  document.getElementById('signInBtn').addEventListener('click', async () => {
+    const email = document.getElementById('authEmailInput').value.trim();
+    const pw = document.getElementById('authPasswordInput').value;
+    try { await fbAuth.signInWithEmailAndPassword(email, pw); }
+    catch (e) { document.getElementById('syncStatus').textContent = 'Sign-in failed: ' + e.message; }
+  });
+  document.getElementById('signUpBtn').addEventListener('click', async () => {
+    const email = document.getElementById('authEmailInput').value.trim();
+    const pw = document.getElementById('authPasswordInput').value;
+    try { await fbAuth.createUserWithEmailAndPassword(email, pw); }
+    catch (e) { document.getElementById('syncStatus').textContent = 'Account creation failed: ' + e.message; }
+  });
+  document.getElementById('googleSignInBtn').addEventListener('click', async () => {
+    try { await fbAuth.signInWithPopup(new firebase.auth.GoogleAuthProvider()); }
+    catch (e) { document.getElementById('syncStatus').textContent = 'Google sign-in failed: ' + e.message; }
+  });
+  document.getElementById('signOutBtn').addEventListener('click', async () => { await fbAuth.signOut(); });
+
+  // The worker's published signal log — public system data, not gated behind
+  // sign-in, so trades taken by the background tick show up even in a browser
+  // that never signed in.
+  //
+  // `latestTick` below is only a summary of the most recent pass: it carries a
+  // direction and a price but no signal identity, so it can never say which
+  // trade was entered or how it ended. Until this listener existed nothing in
+  // the browser read the trades themselves — an autonomously taken trade never
+  // reached the signal log, and the only outcomes the log could show were the
+  // ones a human had clicked. system/workerSignals is a trimmed copy the tick
+  // writes for exactly this, so subscribing does not drag the worker's candle
+  // cache down on every tick.
+  fbDb.collection('system').doc('workerSignals').onSnapshot(
+    (doc) => {
+      if (!doc.exists) return;
+      try {
+        const raw = doc.data().signalLog;
+        const incoming = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        const list = asObjectArray(incoming, ['id']).map(sig =>
+          sig.source ? sig : Object.assign({}, sig, { source: 'worker' }));
+        ingestSignals(list, 'Background worker');
+      } catch (e) {
+        setWorkerLogNote('Could not read the worker signal log: ' + e.message);
+      }
+    },
+    (err) => { setWorkerLogNote('Worker signal log unreadable: ' + err.message); }
+  );
+
+  // Live listener on the server's latest tick — public system data, not gated behind sign-in, so this
+  // updates in real time even if the browser never signed in and never triggered the tick itself.
+  fbDb.collection('system').doc('latestTick').onSnapshot(
+    (doc) => {
+      const statusEl = document.getElementById('bgTickStatus');
+      const detailEl = document.getElementById('bgTickDetail');
+      if (!doc.exists) { statusEl.textContent = 'No background tick has landed yet — see setup above.'; return; }
+      const d = doc.data();
+      const ageMin = Math.round((Date.now() - d.time) / 60000);
+      const staleTxt = ageMin > 20 ? ' <span style="color:#454a56;">(stale — check your external scheduler is still running)</span>' : '';
+      statusEl.innerHTML = 'Last background tick: ' + ageMin + ' min ago' + staleTxt + (d.resolvedThisTick ? ' · resolved ' + d.resolvedThisTick + ' trade(s) this tick' : '');
+      const dirCls = d.direction === 'BUY' ? 'fpos' : d.direction === 'SELL' ? 'fneg' : 'fneu';
+      const macroTag = (label, avail, score) => avail
+        ? '<span style="' + (score > 0.1 ? 'color:#3ecf8e' : score < -0.1 ? 'color:#ef4d5f' : 'color:#5c6270') + '">' + label + ' ' + (score >= 0 ? '+' : '') + score.toFixed(2) + '</span>'
+        : '<span style="color:#454a56;">' + label + ' off</span>';
+      const m = d.macro || {};
+      detailEl.innerHTML = '<div class="zone-item"><span>' + d.direction + ' <span style="color:#454a56;">(' + d.confidence + '%, full engine — structure + macro + meta-labeler)</span></span><span class="mono ' + dirCls + '">$' + fmt(d.price) + '</span></div>'
+        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Entry / SL / TP</span><span class="mono">$' + fmt(d.entry) + ' / $' + fmt(d.sl) + ' / $' + fmt(d.tp) + '</span></div>' : '')
+        + (d.direction !== 'HOLD' ? '<div class="zone-item"><span>Meta-labeler score</span><span class="mono">' + (d.metaTrained ? ((d.metaScore >= 0 ? '+' : '') + fmt(d.metaScore)) : 'not trained yet') + ' <span style="color:#454a56;font-size:9px;">(' + d.metaExampleCount + ' examples)</span></span></div>' : '')
+        + '<div class="zone-item"><span>Macro reads</span><span style="font-size:10px;">' + macroTag('Corr', m.correlationAvailable, m.correlationScore || 0) + ' · ' + macroTag('Fund', m.fundamentalAvailable, m.fundamentalScore || 0) + ' · ' + macroTag('News', m.newsAvailable, m.newsScore || 0) + '</span></div>'
+        + '<div class="zone-item"><span>Session / Regime</span><span class="mono" style="font-size:10px;">' + (d.session || '—') + ' · ' + (d.regime || '—') + '</span></div>';
+    },
+    (err) => { document.getElementById('bgTickStatus').textContent = 'Could not read background tick data: ' + err.message + ' (check Firestore rules allow public read on the "system" collection).'; }
+  );
+} else {
+  updateSyncUI(null);
+  const notConfigured = () => { document.getElementById('syncStatus').textContent = 'Cloud sync not configured yet — ask Claude to finish setup with your Firebase config.'; };
+  document.getElementById('signInBtn').addEventListener('click', notConfigured);
+  document.getElementById('signUpBtn').addEventListener('click', notConfigured);
+  document.getElementById('googleSignInBtn').addEventListener('click', notConfigured);
+}
+document.getElementById('togglePasswordBtn').addEventListener('click', () => {
+  const pwInput = document.getElementById('authPasswordInput');
+  const btn = document.getElementById('togglePasswordBtn');
+  const showing = pwInput.type === 'text';
+  pwInput.type = showing ? 'password' : 'text';
+  btn.textContent = showing ? '👁' : '🙈';
+  btn.setAttribute('aria-label', showing ? 'Show password' : 'Hide password');
+});
+const confMoreToggle = document.getElementById('confMoreToggle');
+if (confMoreToggle) confMoreToggle.addEventListener('click', () => {
+  const more = document.getElementById('confMore');
+  const hidden = more.classList.toggle('hidden');
+  confMoreToggle.textContent = hidden ? 'what is this number?' : 'hide';
+});
+['newsFlattenEnabled', 'newsBlockEnabled', 'weekendFlattenEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { requestReleaseNotifications(); renderCalendar(); });
+});
+document.getElementById('bgSetupToggle').addEventListener('click', () => {
+  document.getElementById('bgSetupNote').classList.toggle('hidden');
+});
+
+// ============================================================
+// TABS
+// ============================================================
+document.querySelectorAll('.tab').forEach(t => {
+  t.addEventListener('click', () => {
+    document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+    t.classList.add('active');
+    // Driven off the buttons rather than a hardcoded list, so adding a tab is
+    // one line of markup and nothing here.
+    document.querySelectorAll('[id^="tab-"]').forEach(panel =>
+      panel.classList.toggle('hidden', panel.id !== 'tab-' + t.dataset.tab));
+    if (t.dataset.tab === 'live') resizeLiveCanvas();
+  });
+});
+
+// ============================================================
+// WEIGHTS UI
+// ============================================================
+const weightIds = ['wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq', 'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews'];
+const weightKeys = { wWeekly: 'weekly', wDaily: 'daily', wHtf: 'htf', wMtf: 'mtf', wLtf: 'ltf', wOb: 'ob', wFvg: 'fvg', wLiq: 'liquidity', wPd: 'premiumDiscount', wPriceAction: 'priceAction', wClassic: 'classic', wCorrelation: 'correlation', wFundamental: 'fundamental', wNews: 'newsSentiment' };
+const weightDefaults = { wWeekly: 15, wDaily: 12, wHtf: 10, wMtf: 8, wLtf: 8, wOb: 9, wFvg: 5, wLiq: 5, wPd: 4, wPriceAction: 9, wClassic: 4, wCorrelation: 7, wFundamental: 8, wNews: 5 };
+weightIds.forEach(id => {
+  const el = document.getElementById(id), out = document.getElementById(id + 'V');
+  el.addEventListener('input', () => { out.textContent = el.value; refreshAll(); });
+});
+document.getElementById('resetWeights').addEventListener('click', () => {
+  weightIds.forEach(id => { document.getElementById(id).value = weightDefaults[id]; document.getElementById(id + 'V').textContent = weightDefaults[id]; });
+  document.getElementById('targetRR').value = 4; document.getElementById('targetRRV').textContent = '1:4';
+  // Persist the reset, or the next reload restores the weights just cleared.
+  if (typeof saveSettings === 'function') { saveSettings(); flagSettingsSaved(); }
+  refreshAll();
+});
+function getWeights() {
+  const w = {};
+  weightIds.forEach(id => { w[weightKeys[id]] = +document.getElementById(id).value; });
+  return w;
+}
+const targetRRSlider = document.getElementById('targetRR');
+targetRRSlider.addEventListener('input', () => {
+  document.getElementById('targetRRV').textContent = '1:' + targetRRSlider.value;
+  if (lastComposite) { const plan = buildTradePlan(lastComposite, +targetRRSlider.value); updateSignalUI(lastComposite, plan, false); }
+});
+function getTargetRR() { return +document.getElementById('targetRR').value; }
+
+// ============================================================
+// STATE + CONNECTION
+// ============================================================
+const SYMBOL = 'XAU/USD';
+const LIVE_INTERVAL = '15min';
+let apiKey = null, dataMode = 'simulated', activeProvider = null;
+let liveData = genData(700, 1928, 900000);
+// Chart display can use its own provider interval without changing the M15 SMC engine feed.
+let chartInterval = '15min';
+let chartData = liveData;
+let chartFetchBusy = false;
+let mtfData = [], htfData = [], dailyData = [], weeklyData = []; // real 1H/4H/Daily/Weekly candles when the provider supports them; empty = fall back to aggregation
+let prevClose = liveData[liveData.length - 1].close;
+let simTickHandle = null, pollPriceHandle = null, resyncHandle = null, mtfResyncHandle = null, htfResyncHandle = null, corrResyncHandle = null, newsResyncHandle = null, dailyResyncHandle = null, weeklyResyncHandle = null;
+// Mutable state that functions defined further up this file reach into.
+// Declared here, above the first top-level refreshAll(), because `let` bindings
+// are in their temporal dead zone until evaluated — declaring them beside their
+// own sections put them after the code that reads them and threw on load.
+// `manual` is the signal panel's own switch: whether a signal generated by
+// hand opens a paper position. Autonomous and worker trades follow `enabled`
+// alone, so turning hand-made trades off never silences the unattended account.
+let paper = { enabled: false, manual: true, startingBalance: PAPER_DEFAULTS.startingBalance, positions: [], epoch: null };
+// Set by paperOpenForSignal on its way through, read by whoever triggered the
+// signal. A one-slot channel rather than a return value because the open
+// happens two calls deep inside addSignalToLog.
+let lastPaperOutcome = null;
+// The most recent live-trade audit, for the audit panel to render.
+let lastTradeAudit = null;
+let autonomy = {
+  enabled: false,
+  cycles: 0,
+  signalsTaken: 0,
+  autoResolved: 0,
+  lastAnalysisAt: null,
+  lastBacktestAt: null,
+  lastSignalAt: null,
+  lastReason: null,
+  consecutiveErrors: 0,
+  skipCycles: 0,
+  lastError: null,
+  gateTally: {}
+};
+
+let lastComposite = null;
+let lastPlan = null;
+
+const connectBtn = document.getElementById('connectBtn');
+const connStatus = document.getElementById('connStatus');
+let liveModeLabel = 'simulated feed';
+const modeLabel = document.getElementById('modeLabel');
+const liveDot = document.getElementById('liveDot');
+const btSourceNote = document.getElementById('btSourceNote');
+const providerSelect = document.getElementById('providerSelect');
+
+// ---------- API quota accounting ----------
+// Every Twelve Data call goes through spendCredit() so the day's usage is a real
+// measured number rather than an estimate. The cap is deliberately below the
+// tier limit: the background worker shares this key and must not be starved by
+// a browser tab that was left open.
+const QUOTA_KEY = 'smc-quota-v1';
+const DEFAULT_DAILY_CAP = 500; // of Twelve Data's 800/day; the rest is reserved for /api/tick
+let quotaState = { day: utcDayKey(), used: 0 };
+
+function loadQuota() {
+  try {
+    const raw = localStorage.getItem(QUOTA_KEY);
+    if (raw) quotaState = rollQuota(JSON.parse(raw), Date.now());
+  } catch (e) { /* fresh start */ }
+  quotaState = rollQuota(quotaState, Date.now());
+}
+function saveQuota() {
+  try { localStorage.setItem(QUOTA_KEY, JSON.stringify(quotaState)); } catch (e) { /* storage unavailable */ }
+}
+function dailyCap() {
+  const el = document.getElementById('aDailyCap');
+  const v = el ? parseInt(el.value, 10) : NaN;
+  return isFinite(v) && v > 0 ? v : DEFAULT_DAILY_CAP;
+}
+// Ring-fenced for the analysis path, sized from the cadence actually configured.
+// Tightening the interval raises the reserve, so speeding autonomy up cannot
+// quietly leave it short of credits later in the day.
+function analysisReserve() {
+  const el = document.getElementById('aInterval');
+  const mins = el ? parseFloat(el.value) : NaN;
+  return criticalReserveFor(isFinite(mins) && mins > 0 ? mins : AUTONOMY_DEFAULTS.analysisIntervalMinutes);
+}
+// Returns false when this call would breach the budget for its priority.
+// During connect, activeProvider is still null while the first calls are already
+// going out — so metering keys off the SELECTED provider. Reading activeProvider
+// here let the whole connect burst through unmetered.
+function meteredProvider() {
+  return activeProvider || (providerSelect && providerSelect.value) || null;
+}
+function spendCredit(priority, cost) {
+  quotaState = rollQuota(quotaState, Date.now());
+  if (meteredProvider() !== 'twelvedata') return true; // only Twelve Data is metered here
+  if (!canSpend(quotaState, dailyCap(), priority, cost || 1, analysisReserve())) return false;
+  quotaState = spendQuota(quotaState, cost || 1);
+  saveQuota();
+  renderQuota();
+  return true;
+}
+function renderQuota() {
+  const el = document.getElementById('quotaReadout');
+  if (!el) return;
+  if (meteredProvider() !== 'twelvedata') { el.textContent = 'API budget tracking applies to Twelve Data only.'; return; }
+  const q = quotaSummary(quotaState, dailyCap(), analysisReserve());
+  const colour = q.pct >= 85 ? '#ef4d5f' : q.pct >= 55 ? '#ffa726' : '#3ecf8e';
+  el.innerHTML = '<span style="color:' + colour + ';">' + q.used + ' / ' + q.cap + ' credits used today (' + q.pct + '%)</span>'
+    + ' <span style="color:#454a56;">· ' + q.reserve + ' ring-fenced for analysis · resets 00:00 UTC</span>'
+    + '<br><span style="color:#454a56;">' + q.note + '</span>';
+}
+
+
+// Each provider exposes: timeSeries(key, interval, outputsize) -> candle[], price(key) -> number,
+// plus mtfInterval/htfInterval — the native interval strings for that provider's real 1H/4H data
+// (null if the provider doesn't support that granularity, in which case the app falls back to
+// aggregating from the 15min feed automatically). Adding a new provider means adding one entry here.
+const PROVIDERS = {
+  twelvedata: {
+    // pollSeconds is the dedicated /price cadence. At 60s it cost 1,440 credits/day
+    // on an 800/day tier — more than the entire quota, for a value the candle resync
+    // already provides. 600s keeps a live-ish tick for the header at ~144/day, and it
+    // is low-priority so it stops entirely once the budget tightens.
+    label: 'Twelve Data', pollSeconds: 600, resyncMinutes: 15, mtfInterval: '1h', htfInterval: '4h', dailyInterval: '1day', weeklyInterval: '1week',
+    async timeSeries(key, interval, outputsize, symbolOverride) {
+      const sym = symbolOverride || SYMBOL;
+      // timezone=UTC forces Twelve Data to return unambiguous UTC timestamps. Without it, "datetime" comes back
+      // with no offset marker (e.g. "2026-08-07 14:30:00"), and new Date(...) on a string like that gets parsed
+      // as the BROWSER's local time, not UTC — silently shifting every session/kill-zone calculation by whatever
+      // the device's UTC offset happens to be. That's what was causing London to show as New York.
+      const qs = new URLSearchParams({ symbol: sym, interval, outputsize, timezone: 'UTC', apikey: key });
+      const r = await fetch('https://api.twelvedata.com/time_series?' + qs);
+      const j = await r.json();
+      if (j.status === 'error' || j.code) throw new Error(j.message || 'Twelve Data error');
+      if (!j.values || !j.values.length) throw new Error('No data returned for ' + sym);
+      return j.values.slice().reverse().map(v => ({ time: parseUtcDatetime(v.datetime), open: +v.open, high: +v.high, low: +v.low, close: +v.close }));
+    },
+    async price(key) {
+      const qs = new URLSearchParams({ symbol: SYMBOL, apikey: key });
+      const r = await fetch('https://api.twelvedata.com/price?' + qs);
+      const j = await r.json();
+      if (j.status === 'error' || j.code) throw new Error(j.message || 'Twelve Data error');
+      const p = parseFloat(j.price);
+      if (!isFinite(p)) throw new Error('No price returned');
+      return p;
+    }
+  },
+  alphavantage: {
+    // Free-tier Alpha Vantage is heavily rate-limited (historically as low as ~25 requests/day) —
+    // polling is intentionally slow here. Check your own dashboard for your plan's actual limit.
+    // FX_INTRADAY only supports up to 60min — no native 4H/daily/weekly, so those stay null (falls back to aggregation).
+    label: 'Alpha Vantage', pollSeconds: 300, resyncMinutes: 30, mtfInterval: '60min', htfInterval: null, dailyInterval: null, weeklyInterval: null,
+    async timeSeries(key, interval, outputsize) {
+      const qs = new URLSearchParams({ function: 'FX_INTRADAY', from_symbol: 'XAU', to_symbol: 'USD', interval, outputsize: outputsize > 100 ? 'full' : 'compact', apikey: key });
+      const r = await fetch('https://www.alphavantage.co/query?' + qs);
+      const j = await r.json();
+      const seriesKey = Object.keys(j).find(k => k.indexOf('Time Series FX') === 0);
+      if (!seriesKey) {
+        const raw = j['Error Message'] || j['Note'] || j['Information'] || JSON.stringify(j);
+        if (/premium/i.test(raw)) throw new Error('Alpha Vantage intraday FX data requires their paid plan (free tier doesn\'t include it) — try Twelve Data instead.');
+        throw new Error(raw || 'Alpha Vantage error — check key or rate limit');
+      }
+      const series = j[seriesKey];
+      const rows = Object.keys(series).sort().map(ts => ({
+        time: new Date(ts.replace(' ', 'T') + 'Z').getTime(),
+        open: +series[ts]['1. open'], high: +series[ts]['2. high'], low: +series[ts]['3. low'], close: +series[ts]['4. close']
+      }));
+      return rows.slice(-outputsize);
+    },
+    async price(key) {
+      const qs = new URLSearchParams({ function: 'CURRENCY_EXCHANGE_RATE', from_currency: 'XAU', to_currency: 'USD', apikey: key });
+      const r = await fetch('https://www.alphavantage.co/query?' + qs);
+      const j = await r.json();
+      const node = j['Realtime Currency Exchange Rate'];
+      const rate = node && node['5. Exchange Rate'];
+      if (!rate) throw new Error(j['Error Message'] || j['Note'] || j['Information'] || 'Alpha Vantage error — check key or rate limit');
+      return parseFloat(rate);
+    }
+  }
+};
+
+// ============================================================
+// PERSISTED KEYS (opt-in "remember on this device" — auto-reconnect on reload)
+// ============================================================
+const KEY_STORE_KEY = 'smc-saved-keys-v1';
+async function saveKeysIfRemembered() {
+  const remember = document.getElementById('rememberKeysCheckbox').checked;
+  if (!remember) { await clearSavedKeys(); return; }
+  const payload = {
+    provider: providerSelect.value,
+    apiKey: document.getElementById('apiKeyInput').value.trim(),
+    fredKey: document.getElementById('fredKeyInput').value.trim(),
+    newsKey: document.getElementById('newsKeyInput').value.trim(),
+    autoBacktest: document.getElementById('autoBacktestCheckbox').checked
+  };
+  try { localStorage.setItem(KEY_STORE_KEY, JSON.stringify(payload)); } catch (e) { /* storage unavailable */ }
+}
+async function loadSavedKeys() {
+  try {
+    const raw = localStorage.getItem(KEY_STORE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* nothing saved */ }
+  return null;
+}
+async function clearSavedKeys() {
+  try { localStorage.removeItem(KEY_STORE_KEY); } catch (e) { /* nothing to clear */ }
+}
+document.getElementById('forgetKeysBtn').addEventListener('click', async () => {
+  await clearSavedKeys();
+  document.getElementById('rememberKeysCheckbox').checked = false;
+  connStatus.textContent = 'Saved keys forgotten on this device.';
+  connStatus.className = 'conn-status';
+});
+document.getElementById('rememberKeysCheckbox').addEventListener('change', () => {
+  if (!document.getElementById('rememberKeysCheckbox').checked) clearSavedKeys();
+  else if (apiKey) saveKeysIfRemembered();
+});
+
+// Fetch each higher timeframe, and record what happened to it.
+//
+// A failure here used to set the series to [] and say nothing. That is not
+// inert: with no real 4H bars the engine AGGREGATES 4H structure from 15-minute
+// candles instead. It is a reasonable fallback and it is not the same thing —
+// the score still reports 4H trend with full weight while reading synthesised
+// bars — so it has to be visible rather than assumed.
+async function fetchHigherTimeframes(provider, key) {
+  const one = async (label, interval, bars, assign) => {
+    if (!interval) { assign([]); timeframeHealth[label] = { ok: true, skipped: 'provider has no such interval' }; return; }
+    if (!spendCredit('normal')) {
+      assign([]);
+      timeframeHealth[label] = { ok: false, reason: 'skipped to stay inside the daily API budget', aggregated: true, at: Date.now() };
+      return;
+    }
+    try {
+      const d = await provider.timeSeries(key, interval, bars);
+      if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
+      assign(d);
+      timeframeHealth[label] = { ok: true, at: Date.now() };
+    } catch (e) {
+      assign([]);
+      timeframeHealth[label] = {
+        ok: false,
+        reason: (e && e.message) || String(e),
+        aggregated: true,
+        at: Date.now()
+      };
+    }
+  };
+  await one('1H', provider.mtfInterval, 300, d => { mtfData = d; });
+  await one('4H', provider.htfInterval, 200, d => { htfData = d; });
+  await one('Daily', provider.dailyInterval, 200, d => { dailyData = d; });
+  await one('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }); // ~2 years
+  renderTimeframeHealth();
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+async function fetchFredSeries(seriesId, fredKey, limit) {
+  limit = limit || 60;
+  // Routed through /api/fred (same-origin serverless function) instead of calling stlouisfed.org
+  // directly from the browser — FRED doesn't set CORS headers for arbitrary sites, so a direct
+  // client-side fetch gets silently blocked. The proxy calls FRED server-side, where CORS doesn't apply.
+  // sort_order MUST be 'desc'. FRED applies `limit` AFTER sorting, so asking for
+  // 120 ascending returns the 120 OLDEST observations the series ever had — for
+  // DGS2 that is 1976, for VIXCLS 1990, for DTWEXBGS 2006. Every macro number in
+  // this system was computed from those. Nothing failed: the values were finite,
+  // correlations came out, and a plausible number reached the score. Descending
+  // gives the most recent, and the result is reversed back to ascending because
+  // everything downstream assumes oldest-first.
+  const qs = new URLSearchParams({ series_id: seriesId, api_key: fredKey, file_type: 'json', sort_order: 'desc', limit: String(limit * 2) });
+  const r = await fetch('/api/fred?' + qs);
+  const j = await r.json();
+  if (j.error_code) throw new Error(j.error_message || 'FRED error');
+  if (!j.observations) throw new Error(j.error || 'No observations returned');
+  const obs = j.observations.filter(o => o.value !== '.').map(o => ({ time: new Date(o.date + 'T00:00:00Z').getTime(), close: parseFloat(o.value) }));
+  if (!obs.length) throw new Error('No usable data points');
+  // Newest-first from FRED; everything downstream expects oldest-first.
+  obs.sort((a, b) => a.time - b.time);
+  return obs.slice(-limit);
+}
+
+let correlationScore = 0;
+// Raw aligned series kept for the macro model. The univariate score throws away
+// exactly what a multivariate fit needs — the series themselves.
+let macroSeries = { gold: null, drivers: [] };
+let macroModel = null;
+let correlationScoreSource = 'univariate';
+function useMacroModel() {
+  const el = document.getElementById('useMacroModel');
+  return el ? !!el.checked : true;
+}
+let correlationDetails = []; // { key, label, source, available, pctChange, corr, contribution, reason }
+async function refreshCorrelation(providerId, tdKey, fredKey) {
+  const results = [];
+
+  // Fetch gold's own daily history exactly once and reuse it for both FRED and Twelve Data correlation math —
+  // fetching it twice was quietly burning one of the eight Twelve Data calls/min this whole engine gets.
+  let xauDaily = null;
+  if (providerId === 'twelvedata' && tdKey) {
+    try { if (!spendCredit('low')) throw new Error('budget'); xauDaily = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60); await sleep(1200); }
+    catch (e) { xauDaily = null; }
+  }
+  macroSeries = { gold: xauDaily, drivers: [] };
+
+  // FRED side — independent of the price provider, no meaningful rate limit, so these always attempt if a key is present.
+  if (fredKey) {
+    for (const inst of FRED_INSTRUMENTS) {
+      try {
+        const obs = await fetchFredSeries(inst.seriesId, fredKey, 60);
+        macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: obs });
+        // Yields move in basis points, not percentages of their own level —
+        // seriesDeltas picks the right transform per instrument.
+        // Aligned on the calendar, not by array position: gold trades Sunday
+        // evening to Friday evening, FRED skips US federal holidays, and zipping
+        // the two by index offsets everything before each holiday.
+        const corr = xauDaily ? correlateByDay(xauDaily, obs, inst.kind) : null;
+        const pctChange = latestChangeOf(obs, inst.kind);
+        const latestDate = obs.length ? obs[obs.length - 1].time : null;
+        // Weight by the ACTUAL measured correlation strength/sign, not the assumed polarity — a genuinely
+        // weak or unstable relationship (like oil's has historically been) shrinks toward zero influence on
+        // its own instead of me having to guess the right number. Falls back to the assumed polarity only
+        // when correlation can't be measured yet (no gold daily history available to compare against).
+        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate });
+      } catch (e) {
+        results.push({ key: inst.key, label: inst.label, source: 'FRED', available: false, reason: e.message });
+      }
+    }
+  } else {
+    FRED_INSTRUMENTS.forEach(inst => results.push({ key: inst.key, label: inst.label, source: 'FRED', available: false, reason: 'No FRED API key entered.' }));
+  }
+
+  // Twelve Data side — only the instruments FRED can't cover, throttled from the very first call (not just between calls).
+  if (providerId === 'twelvedata' && tdKey) {
+    if (!xauDaily) {
+      CORRELATION_INSTRUMENTS.forEach(inst => results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: false, reason: 'Could not fetch gold daily history to correlate against.' }));
+    } else {
+      for (const inst of CORRELATION_INSTRUMENTS) {
+        try {
+          if (!spendCredit('low')) throw new Error('Skipped to stay inside the daily API budget.');
+          const candles = await PROVIDERS.twelvedata.timeSeries(tdKey, '1day', 60, inst.symbol);
+          macroSeries.drivers.push({ key: inst.key, label: inst.label, kind: inst.kind, series: candles });
+          const corr = correlateByDay(xauDaily, candles, inst.kind);
+          const pctChange = latestChangeOf(candles, inst.kind);
+          const latestDate = candles.length ? candles[candles.length - 1].time : null;
+          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: true, pctChange, corr, contribution: macroContribution(pctChange, corr, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate });
+        } catch (e) {
+          results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: false, reason: e.message });
+        }
+        await sleep(1200); // stay well under Twelve Data's free-tier 8 requests/minute cap
+      }
+    }
+  } else {
+    CORRELATION_INSTRUMENTS.forEach(inst => results.push({ key: inst.key, label: inst.label, source: 'Twelve Data', available: false, reason: 'Requires Twelve Data as the connected price provider.' }));
+  }
+
+  correlationDetails = results;
+  const avail = results.filter(r => r.available);
+  const univariateScore = aggregateMacroScore(avail.map(r => r.contribution));
+
+  // Fit the multivariate model and use it when it clears its own quality bar.
+  // The univariate average stays as the fallback: it is worse, but a bad fit
+  // dressed up as a number is worse still.
+  macroModel = (macroSeries.gold && macroSeries.drivers.length)
+    ? fitMacroModel(macroSeries.gold, macroSeries.drivers)
+    : null;
+  const modelScore = macroModelScore(macroModel);
+  correlationScore = (modelScore != null && useMacroModel()) ? modelScore : univariateScore;
+  correlationScoreSource = (modelScore != null && useMacroModel()) ? 'model' : 'univariate';
+  accumulateKnowledge();
+}
+
+let fundamentalScore = 0;
+let fundamentalDetails = []; // { key, label, available, pctChange, contribution, reason }
+async function refreshFundamentals(fredKey) {
+  const results = [];
+  if (!fredKey) {
+    FUNDAMENTAL_INSTRUMENTS.forEach(inst => results.push({ key: inst.key, label: inst.label, available: false, reason: 'No FRED API key entered.' }));
+    fundamentalDetails = results;
+    fundamentalScore = 0;
+    return;
+  }
+  for (const inst of FUNDAMENTAL_INSTRUMENTS) {
+    try {
+      // 24 monthly/quarterly points is plenty of lookback for these low-frequency series.
+      const obs = await fetchFredSeries(inst.seriesId, fredKey, 24);
+      if (obs.length < 2) throw new Error('Not enough data points');
+      const pctChange = pctChangeOf(obs);
+      // No measured correlation for fundamentals — these are low-frequency prints,
+      // so the assumed polarity is the weight.
+      results.push({ key: inst.key, label: inst.label, available: true, pctChange, contribution: macroContribution(pctChange, null, inst.polarity), polarity: inst.polarity, kind: inst.kind, latestDate: obs[obs.length - 1].time });
+    } catch (e) {
+      results.push({ key: inst.key, label: inst.label, available: false, reason: e.message });
+    }
+  }
+  fundamentalDetails = results;
+  const avail = results.filter(r => r.available);
+  fundamentalScore = aggregateMacroScore(avail.map(r => r.contribution));
+}
+
+// News Sentiment Engine — Alpha Vantage's own sentiment classifier does the reading, not a homemade keyword scanner.
+const NEWS_TOPICS = 'economy_macro,economy_monetary,financial_markets';
+let newsSentimentScore = 0;
+let newsAvgScore = null;
+let newsDetails = [];
+let newsError = null;
+async function refreshNewsSentiment(avKey) {
+  newsError = null;
+  if (!avKey) {
+    newsDetails = [];
+    newsSentimentScore = 0;
+    newsAvgScore = null;
+    newsError = 'No Alpha Vantage key entered.';
+    return;
+  }
+  try {
+    const qs = new URLSearchParams({ function: 'NEWS_SENTIMENT', topics: NEWS_TOPICS, sort: 'LATEST', limit: '50', apikey: avKey });
+    const r = await fetch('https://www.alphavantage.co/query?' + qs);
+    const j = await r.json();
+    const errMsg = j['Error Message'] || j['Note'] || j['Information'];
+    if (errMsg) throw new Error(errMsg);
+    const feed = j.feed || [];
+    if (!feed.length) throw new Error('No articles returned for these topics right now.');
+    const articles = feed.slice(0, 15).map(a => ({
+      title: a.title, source: a.source, url: a.url, timePublished: a.time_published,
+      sentimentScore: parseFloat(a.overall_sentiment_score),
+      sentimentLabel: a.overall_sentiment_label
+    })).filter(a => !isNaN(a.sentimentScore));
+    newsDetails = articles;
+    const scores = articles.map(a => a.sentimentScore);
+    newsAvgScore = scores.length ? scores.reduce((s, v) => s + v, 0) / scores.length : 0;
+    // Inverted deliberately — see the panel description for why (risk-on market news tends to be gold-bearish).
+    newsSentimentScore = Math.max(-1, Math.min(1, -newsAvgScore));
+  } catch (e) {
+    newsDetails = [];
+    newsSentimentScore = 0;
+    newsAvgScore = null;
+    newsError = e.message;
+  }
+}
+
+document.getElementById('refreshNewsBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('refreshNewsBtn');
+  btn.disabled = true; btn.textContent = '...';
+  await refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim());
+  await saveKeysIfRemembered();
+  refreshAll();
+  btn.disabled = false; btn.textContent = 'Refresh';
+});
+
+document.getElementById('refreshCorrBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('refreshCorrBtn');
+  btn.disabled = true; btn.textContent = '...';
+  const fredKey = document.getElementById('fredKeyInput').value.trim();
+  await refreshCorrelation(activeProvider, apiKey, fredKey);
+  await refreshFundamentals(fredKey);
+  await saveKeysIfRemembered();
+  refreshAll();
+  btn.disabled = false; btn.textContent = 'Refresh';
+});
+
+// Named + awaitable so bootstrap() can restore a saved connection and then run
+// catch-up once it has actually completed, rather than firing a click and hoping.
+async function connectProvider() {
+  const key = document.getElementById('apiKeyInput').value.trim();
+  const providerId = providerSelect.value;
+  const provider = PROVIDERS[providerId];
+  if (!key) { connStatus.textContent = 'Enter a key first.'; connStatus.className = 'conn-status err'; return; }
+  connectBtn.disabled = true; connectBtn.textContent = 'Connecting...';
+  connStatus.textContent = 'Connecting to ' + provider.label + '...'; connStatus.className = 'conn-status';
+  try {
+    spendCredit('critical');
+    const candles = await provider.timeSeries(key, LIVE_INTERVAL, 500);
+    apiKey = key; activeProvider = providerId;
+    liveData = candles;
+    if (chartInterval === LIVE_INTERVAL) chartData = liveData;
+    lastPriceUpdateTime = Date.now();
+    prevClose = liveData.length > 1 ? liveData[liveData.length - 2].close : liveData[liveData.length - 1].close;
+    dataMode = 'live';
+    if (simTickHandle) clearInterval(simTickHandle);
+    liveModeLabel = 'live · ' + LIVE_INTERVAL + ' · ' + provider.label;
+    modeLabel.textContent = liveModeLabel;
+    liveDot.classList.add('on');
+    connStatus.textContent = 'Connected to ' + provider.label + '. Live 15-minute candles for ' + SYMBOL + '.';
+    connStatus.className = 'conn-status ok';
+    btSourceNote.textContent = 'Data source: ' + provider.label + ' — connected.';
+    await fetchHigherTimeframes(provider, key);
+    if (chartInterval !== LIVE_INTERVAL) await fetchChartTimeframe();
+    else { chartData = liveData; renderChartFeedStatus(); }
+    await refreshCorrelation(providerId, key, document.getElementById('fredKeyInput').value.trim());
+    await refreshFundamentals(document.getElementById('fredKeyInput').value.trim());
+    await refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim());
+    applyKnowledgeBaseWeights();
+    refreshAll();
+    startLivePolling();
+    await saveKeysIfRemembered();
+    startAutoBacktest();
+  } catch (e) {
+    connStatus.textContent = 'Connection failed: ' + e.message + ' — staying on simulated data.';
+    connStatus.className = 'conn-status err';
+  }
+  connectBtn.disabled = false; connectBtn.textContent = 'Connect';
+  renderQuota();
+  // A fresh connection is exactly when autonomy should get to work. Without this
+  // it would sit idle until the next 60s heartbeat noticed the provider was up.
+  if (autonomy.enabled && dataMode === 'live') {
+    await refreshCalendar(false);
+    await autonomyCatchUp();
+    autonomy.lastAnalysisAt = null; // the new connection deserves an immediate pass
+    autonomyHeartbeat();
+  }
+}
+connectBtn.addEventListener('click', () => { connectProvider(); });
+
+function startLivePolling() {
+  if (pollPriceHandle) clearInterval(pollPriceHandle);
+  if (resyncHandle) clearInterval(resyncHandle);
+  if (mtfResyncHandle) clearInterval(mtfResyncHandle);
+  if (htfResyncHandle) clearInterval(htfResyncHandle);
+  if (dailyResyncHandle) clearInterval(dailyResyncHandle);
+  if (weeklyResyncHandle) clearInterval(weeklyResyncHandle);
+  const provider = PROVIDERS[activeProvider];
+  pollPriceHandle = setInterval(pollPrice, provider.pollSeconds * 1000);
+  // Autonomy resyncs candles as step 1 of its own cycle. Running this loop as well
+  // would pay for the same 15-minute candles twice.
+  resyncHandle = setInterval(() => { if (!autonomy.enabled) resyncCandles(); }, provider.resyncMinutes * 60 * 1000);
+  // Higher timeframes resync on their own natural cadence — no point re-fetching a 4H
+  // candle that hasn't closed yet, and it's cheaper on the API quota than constant polling.
+  if (provider.mtfInterval) mtfResyncHandle = setInterval(() => resyncTimeframe('1H', provider.mtfInterval, 300, d => { mtfData = d; }), 60 * 60 * 1000);
+  if (provider.htfInterval) htfResyncHandle = setInterval(() => resyncTimeframe('4H', provider.htfInterval, 200, d => { htfData = d; }), 4 * 60 * 60 * 1000);
+  // Daily/weekly candles barely move intraday — resyncing a few times a day (daily) or once a day
+  // (weekly) is plenty and keeps this well clear of any provider's rate limit.
+  if (provider.dailyInterval) dailyResyncHandle = setInterval(() => resyncTimeframe('Daily', provider.dailyInterval, 200, d => { dailyData = d; }), 12 * 60 * 60 * 1000);
+  if (provider.weeklyInterval) weeklyResyncHandle = setInterval(() => resyncTimeframe('Weekly', provider.weeklyInterval, 104, d => { weeklyData = d; }), 24 * 60 * 60 * 1000);
+  // Correlation uses daily bars — no point checking more than a few times a day.
+  if (corrResyncHandle) clearInterval(corrResyncHandle);
+  corrResyncHandle = setInterval(() => {
+    if (!canSpend(quotaState, dailyCap(), 'low', 3, analysisReserve())) return; // 3 Twelve Data credits per refresh
+    const fk = document.getElementById('fredKeyInput').value.trim();
+    refreshCorrelation(activeProvider, apiKey, fk).then(() => refreshFundamentals(fk)).then(refreshAll);
+  }, 4 * 60 * 60 * 1000);
+  // News sentiment resyncs less often than everything else — Alpha Vantage's free tier is the tightest
+  // rate limit in this whole app, and headline-level sentiment doesn't meaningfully change hour to hour.
+  if (newsResyncHandle) clearInterval(newsResyncHandle);
+  newsResyncHandle = setInterval(() => {
+    refreshNewsSentiment(document.getElementById('newsKeyInput').value.trim()).then(refreshAll);
+  }, 6 * 60 * 60 * 1000);
+  // The feed just changed wholesale. Whatever the audit said about the previous
+  // one describes nothing that is still on screen.
+  auditAfterFeedChange();
+  // A freshly loaded calendar may put a release minutes away that the system
+  // did not know about a moment ago.
+  try { flattenForNews(); } catch (e) { /* the watch will retry */ }
+  // And fresh candles may have filled or resolved something already open.
+  try { advanceLiveTrades(); } catch (e) { /* the watch will retry */ }
+}
+// Higher-timeframe resyncs used to end in `.catch(() => {})`. A failure was
+// therefore completely silent: the series simply stopped updating while the
+// engine kept scoring structure off it. Weekly, daily, 4H and 1H together carry
+// roughly 45 of the composite's ~109 weight, so the largest block of the score
+// could be describing a market from days ago with nothing on screen to say so.
+//
+// Failures are now counted, surfaced, and left where the auditor can see them —
+// it checks each series against its own cadence and reports one that has
+// stopped moving.
+const timeframeHealth = {};
+
+async function resyncTimeframe(label, interval, bars, assign) {
+  if (!spendCredit('normal')) {
+    timeframeHealth[label] = { ok: false, reason: 'skipped to stay inside the daily API budget', at: Date.now() };
+    renderTimeframeHealth();
+    return;
+  }
+  try {
+    const d = await PROVIDERS[activeProvider].timeSeries(apiKey, interval, bars);
+    if (!Array.isArray(d) || !d.length) throw new Error('provider returned no candles');
+    assign(d);
+    timeframeHealth[label] = { ok: true, at: Date.now() };
+    renderTimeframeHealth();
+    refreshAll();
+  } catch (e) {
+    const prev = timeframeHealth[label] || {};
+    timeframeHealth[label] = {
+      ok: false,
+      reason: (e && e.message) || String(e),
+      failures: (prev.failures || 0) + 1,
+      at: Date.now()
+    };
+    renderTimeframeHealth();
+  }
+}
+
+function renderTimeframeHealth() {
+  const el = document.getElementById('timeframeHealth');
+  if (!el) return;
+  const bad = Object.keys(timeframeHealth).filter(k => !timeframeHealth[k].ok);
+  if (!bad.length) { el.textContent = ''; el.classList.add('hidden'); return; }
+  el.classList.remove('hidden');
+  const aggregated = bad.filter(k => timeframeHealth[k].aggregated);
+  el.innerHTML = '⚠️ <strong>Higher-timeframe data is not loading.</strong> '
+    + bad.map(k => k + ' — ' + escapeAttr(timeframeHealth[k].reason)
+        + (timeframeHealth[k].failures > 1 ? ' (' + timeframeHealth[k].failures + ' attempts)' : '')).join('; ')
+    + '. '
+    + (aggregated.length
+        ? escapeAttr(aggregated.join(' and ')) + ' structure is being AGGREGATED from 15-minute candles rather than read from real bars, '
+          + 'and still carries its full weight in the score.'
+        : 'Structure on those timeframes is frozen and still carries its full weight in the score.');
+}
+
+let lastPriceUpdateTime = null;
+// The dedicated price endpoint costs one credit per call and only nudges the
+// last candle's close — which the candle resync already refreshes properly. At
+// a 60s interval it alone came to 1,440 credits/day against an 800/day tier,
+// which exhausted the quota (and the background worker's share of it) by early
+// afternoon. It is now a low-priority extra: nice while there is budget spare,
+// first to be dropped when there isn't.
+async function pollPrice() {
+  if (!apiKey || !activeProvider) return;
+  if (!spendCredit('low')) return;
+  try {
+    const p = await PROVIDERS[activeProvider].price(apiKey);
+    const last = liveData[liveData.length - 1];
+    last.close = p; last.high = Math.max(last.high, p); last.low = Math.min(last.low, p);
+    lastPriceUpdateTime = Date.now();
+    refreshAll();
+  } catch (e) { connStatus.textContent = 'Price update failed: ' + e.message; connStatus.className = 'conn-status err'; }
+}
+let candlesStaleForBudget = false;
+async function resyncCandles() {
+  if (!apiKey || !activeProvider) return;
+  // Only reachable once the FULL cap is gone, reserve included. Analysis still
+  // runs on the last candles fetched rather than stopping — degraded, not dead —
+  // and the panel says so instead of quietly showing old numbers as current.
+  if (!spendCredit('critical')) { candlesStaleForBudget = true; renderQuota(); return; }
+  candlesStaleForBudget = false;
+  try {
+    liveData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 500);
+    if (chartInterval === LIVE_INTERVAL) chartData = liveData;
+    lastPriceUpdateTime = Date.now();
+    refreshAll();
+  } catch (e) { /* keep last good data */ }
+}
+// If the feed hasn't produced a real price update in far longer than expected, entries/SL/TP generated
+// from it are stale — this makes that visible instead of silently trading against an out-of-date market.
+function checkFeedStaleness() {
+  const warnEl = document.getElementById('staleFeedWarning');
+  if (!warnEl) return;
+  if (dataMode !== 'live' || !lastPriceUpdateTime || !activeProvider) { warnEl.classList.add('hidden'); return; }
+  const provider = PROVIDERS[activeProvider];
+  const staleThresholdMs = provider.pollSeconds * 1000 * 4; // 4 missed polls in a row = genuinely stale, not just one slow tick
+  const ageMs = Date.now() - lastPriceUpdateTime;
+  if (ageMs > staleThresholdMs) {
+    const ageMin = Math.round(ageMs / 60000);
+    warnEl.textContent = '⚠ Price feed stale — last real update ' + ageMin + ' min ago. Entries/SL/TP below may not reflect the current market. Try reconnecting.';
+    warnEl.classList.remove('hidden');
+  } else {
+    warnEl.classList.add('hidden');
+  }
+}
+
+// ============================================================
+// CHART
+// ============================================================
+const chartTfButtons = Array.from(document.querySelectorAll('.chart-tf-btn'));
+function renderChartFeedStatus(message) {
+  const status = document.getElementById('chartFeedStatus');
+  if (!status) return;
+  const labels = { '1min':'M1', '5min':'M5', '15min':'M15', '30min':'M30', '1h':'H1', '4h':'H4' };
+  status.textContent = (labels[chartInterval] || chartInterval) + (dataMode === 'live' ? ' · ' + (PROVIDERS[activeProvider]?.label || 'live provider') : ' · simulated until connected') + (message ? ' · ' + message : '');
+  chartTfButtons.forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.interval === chartInterval);
+    btn.disabled = chartFetchBusy;
+  });
+}
+async function fetchChartTimeframe() {
+  if (!apiKey || !activeProvider || dataMode !== 'live') {
+    chartData = chartInterval === LIVE_INTERVAL ? liveData : [];
+    renderChartFeedStatus('connect a provider to load this timeframe');
+    resizeLiveCanvas();
+    return;
+  }
+  if (chartFetchBusy) return;
+  chartFetchBusy = true; renderChartFeedStatus('loading…');
+  try {
+    if (!spendCredit('low')) throw new Error('API budget reserve reached');
+    const requestedInterval = chartInterval;
+    const rows = await PROVIDERS[activeProvider].timeSeries(apiKey, requestedInterval, 500);
+    if (requestedInterval === chartInterval) {
+      chartData = rows;
+      renderChartFeedStatus('provider candles');
+    }
+  } catch (err) {
+    renderChartFeedStatus('load failed: ' + ((err && err.message) || 'unknown error'));
+    if (chartInterval === LIVE_INTERVAL) chartData = liveData;
+  } finally {
+    chartFetchBusy = false;
+    renderChartFeedStatus();
+    resizeLiveCanvas();
+  }
+}
+chartTfButtons.forEach(btn => btn.addEventListener('click', async () => {
+  if (btn.dataset.interval === chartInterval) return;
+  chartInterval = btn.dataset.interval;
+  if (chartInterval === LIVE_INTERVAL) { chartData = liveData; renderChartFeedStatus(); resizeLiveCanvas(); return; }
+  renderChartFeedStatus();
+  await fetchChartTimeframe();
+}));
+renderChartFeedStatus();
+
+const chartCanvas = document.getElementById('chartCanvas');
+const chartCtx = chartCanvas.getContext('2d');
+function resizeLiveCanvas() {
+  const rect = chartCanvas.parentElement.getBoundingClientRect();
+  const w = Math.min(rect.width - 2, window.innerWidth - 22);
+  const h = 260;
+  chartCanvas.width = w * window.devicePixelRatio; chartCanvas.height = h * window.devicePixelRatio;
+  chartCanvas.style.width = w + 'px'; chartCanvas.style.height = h + 'px';
+  chartCtx.setTransform(1, 0, 0, 1, 0, 0); chartCtx.scale(window.devicePixelRatio, window.devicePixelRatio);
+  drawChart(chartCtx, w, h);
+}
+function drawChart(ctx, w, h) {
+  const series = Array.isArray(chartData) && chartData.length ? chartData : liveData;
+  const visible = series.slice(-80);
+  const offset = series.length - visible.length;
+  ctx.clearRect(0, 0, w, h);
+  const pad = { top: 16, bottom: 16, left: 4, right: 4 };
+  const chartW = w - pad.left - pad.right, chartH = h - pad.top - pad.bottom;
+  const minP = Math.min(...visible.map(d => d.low)) - 1, maxP = Math.max(...visible.map(d => d.high)) + 1;
+  const range = maxP - minP || 1;
+  const xStep = chartW / (visible.length - 1 || 1);
+  const xOf = idx => pad.left + (idx - offset) * xStep;
+  const yOf = price => pad.top + (maxP - price) / range * chartH;
+
+  ctx.strokeStyle = '#1a1d26'; ctx.lineWidth = 0.5;
+  for (let i = 0; i < 5; i++) { let y = pad.top + (i / 4) * chartH; ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke(); }
+
+  // OB/FVG zone indexes belong to the engine's M15 series; only overlay them when the chart shows that same series.
+  if (lastComposite && chartInterval === LIVE_INTERVAL) {
+    [...lastComposite.obs, ...lastComposite.fvgs].forEach(z => {
+      if (z.mitigated || z.index < offset - 5) return;
+      const x1 = Math.max(pad.left, xOf(z.index));
+      const x2 = w - pad.right;
+      const y1 = yOf(z.high), y2 = yOf(z.low);
+      ctx.fillStyle = z.dir === 'bullish' ? 'rgba(62,207,142,0.10)' : 'rgba(239,77,95,0.10)';
+      ctx.fillRect(x1, y1, x2 - x1, Math.max(1, y2 - y1));
+      ctx.strokeStyle = z.dir === 'bullish' ? 'rgba(62,207,142,0.35)' : 'rgba(239,77,95,0.35)';
+      ctx.lineWidth = 1; ctx.strokeRect(x1, y1, x2 - x1, Math.max(1, y2 - y1));
+    });
+  }
+
+  for (let i = 0; i < visible.length; i++) {
+    const d = visible[i], x = pad.left + i * xStep;
+    const yHigh = yOf(d.high), yLow = yOf(d.low), yOpen = yOf(d.open), yClose = yOf(d.close);
+    const isBull = d.close >= d.open;
+    ctx.fillStyle = isBull ? '#3ecf8e' : '#ef4d5f'; ctx.strokeStyle = ctx.fillStyle; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x, yHigh); ctx.lineTo(x, yLow); ctx.stroke();
+    const bodyTop = Math.min(yOpen, yClose), bodyH = Math.max(1, Math.abs(yOpen - yClose));
+    ctx.fillRect(x - 2.5, bodyTop, 5, bodyH);
+  }
+
+  const ema9 = calcEMA(series, 9), ema21 = calcEMA(series, 21), ema50 = calcEMA(series, 50);
+  function drawEMA(arr, color) {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.beginPath(); let started = false;
+    for (let i = 0; i < visible.length; i++) {
+      const idx = offset + i, val = arr[idx]; if (val == null) continue;
+      const x = pad.left + i * xStep, y = yOf(val);
+      if (!started) { ctx.moveTo(x, y); started = true; } else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+  drawEMA(ema9, '#4f8bff'); drawEMA(ema21, '#ffa726'); drawEMA(ema50, '#8b93a3');
+}
+
+// ============================================================
+// UI REFRESH
+// ============================================================
+function badgeHtml(trend, labels) {
+  labels = labels || { bullish: 'BULL', bearish: 'BEAR', neutral: 'NEUTRAL' };
+  const cls = trend === 'bullish' ? 'bullish' : trend === 'bearish' ? 'bearish' : 'neutral';
+  const txt = trend === 'bullish' ? labels.bullish : trend === 'bearish' ? labels.bearish : labels.neutral;
+  return '<span class="badge ' + cls + '">' + txt + '</span>';
+}
+// The header dot means "a provider is connected", which on a Saturday reads as
+// "the market is trading". Two different facts, and only one of them was shown.
+function renderMarketClock() {
+  const clock = marketClock(Date.now());
+  const dot = document.getElementById('liveDot');
+  const label = document.getElementById('modeLabel');
+  if (!dot || !label) return;
+  if (clock.open) {
+    if (dataMode === 'live') dot.classList.add('on');
+    label.textContent = liveModeLabel;
+    return;
+  }
+  dot.classList.remove('on');
+  const h = clock.hoursUntilOpen;
+  // Keep the feed mode visible alongside it — on the simulated feed "market
+  // closed" alone would drop the one caveat that matters more.
+  label.textContent = (dataMode === 'live' ? '' : 'simulated · ') + 'market closed · reopens in ' +
+    (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h');
+}
+
+function refreshAll() {
+  renderMarketClock();
+  if (typeof renderPaper === 'function' && paper && paper.positions.length) renderPaper();
+  const weights = getWeights();
+  lastComposite = computeComposite(liveData, liveData.length - 1, weights, mtfData, htfData, correlationScore, fundamentalScore, newsSentimentScore, dailyData, weeklyData);
+  if (!lastComposite) return;
+  const r = lastComposite;
+  lastPlan = buildTradePlan(lastComposite, getTargetRR());
+
+  document.getElementById('livePrice').innerText = '$' + fmt(r.price);
+  const change = r.price - prevClose, pct = (change / prevClose) * 100;
+  const chEl = document.getElementById('priceChange');
+  chEl.innerText = (change >= 0 ? '+' : '') + fmt(change) + ' (' + (change >= 0 ? '+' : '') + pct.toFixed(2) + '%)';
+  document.getElementById('livePrice').className = 'price mono ' + (change >= 0 ? 'up' : 'down');
+  chEl.style.color = change >= 0 ? '#3ecf8e' : '#ef4d5f';
+
+  document.getElementById('mRsi').innerText = r.curRsi.toFixed(1);
+  document.getElementById('mAtr').innerText = fmt(r.atr);
+  document.getElementById('mEma').innerText = fmt(r.cEma9) + ' / ' + fmt(r.cEma21);
+  document.getElementById('mZone').innerHTML = r.pd ? badgeHtml(r.pd.zone === 'premium' ? 'bearish' : 'bullish', { bullish: 'DISCOUNT', bearish: 'PREMIUM' }) : badgeHtml('neutral');
+
+  document.getElementById('biasWeekly').innerHTML = badgeHtml(r.structWeekly.trend);
+  document.getElementById('biasDaily').innerHTML = badgeHtml(r.structDaily.trend);
+  document.getElementById('biasLtf').innerHTML = badgeHtml(r.structLtf.trend);
+  document.getElementById('biasMtf').innerHTML = badgeHtml(r.structMtf.trend);
+  document.getElementById('biasHtf').innerHTML = badgeHtml(r.structHtf.trend);
+
+  const lastEv = r.structLtf.events.length ? r.structLtf.events[r.structLtf.events.length - 1] : null;
+  document.getElementById('lastEvent').textContent = lastEv
+    ? 'LTF: ' + lastEv.type + ' ' + lastEv.direction + ' at $' + fmt(lastEv.level) + ' (' + (liveData.length - 1 - lastEv.index) + ' bars ago)'
+    : 'No structure break detected yet.';
+  document.getElementById('priceActionLine').textContent = r.priceAction && r.priceAction.pattern
+    ? 'Price action: ' + r.priceAction.pattern + ' on the latest candle.'
+    : 'No price action pattern on the latest candle.';
+
+  const obList = document.getElementById('obList');
+  const activeObs = r.obs.filter(o => !o.mitigated).slice(-4).reverse();
+  obList.innerHTML = activeObs.length ? activeObs.map(o => {
+    const c = classifyZone(o, o.dir === 'bullish' ? 'BUY' : 'SELL', r);
+    const strengthCls = c.strength === 'Strong' ? 'fpos' : c.strength === 'Weak' ? 'fneg' : 'fneu';
+    const badge = c.isActive
+      ? '<span class="' + strengthCls + '">' + c.strength + '</span>'
+      : '<span style="color:#454a56;">Dead</span>';
+    return '<div class="zone-item ' + o.dir + '" style="' + (c.isActive ? '' : 'opacity:0.55;') + '"><span>' + (o.dir === 'bullish' ? '🟢 Bullish OB' : '🔴 Bearish OB') + ' <span style="font-size:9px;">(' + badge + ')</span></span><span class="mono">$' + fmt(o.low) + ' – $' + fmt(o.high) + '</span></div>';
+  }).join('') : '<div class="zone-empty">None detected in current window.</div>';
+
+  const fvgList = document.getElementById('fvgList');
+  const activeFvgs = r.fvgs.filter(f => !f.mitigated).slice(-4).reverse();
+  fvgList.innerHTML = activeFvgs.length ? activeFvgs.map(f => {
+    const c = classifyZone(f, f.dir === 'bullish' ? 'BUY' : 'SELL', r);
+    const strengthCls = c.strength === 'Strong' ? 'fpos' : c.strength === 'Weak' ? 'fneg' : 'fneu';
+    const badge = c.isActive
+      ? '<span class="' + strengthCls + '">' + c.strength + '</span>'
+      : '<span style="color:#454a56;">Dead</span>';
+    return '<div class="zone-item ' + f.dir + '" style="' + (c.isActive ? '' : 'opacity:0.55;') + '"><span>' + (f.dir === 'bullish' ? '🟢 Bullish FVG' : '🔴 Bearish FVG') + ' <span style="font-size:9px;">(' + badge + ')</span></span><span class="mono">$' + fmt(f.low) + ' – $' + fmt(f.high) + '</span></div>';
+  }).join('') : '<div class="zone-empty">None detected in current window.</div>';
+
+  document.getElementById('liqBuySide').textContent = r.liquidity.buySideLiquidity.length;
+  document.getElementById('liqSellSide').textContent = r.liquidity.sellSideLiquidity.length;
+
+  const mapEntries = [];
+  r.liquidity.buySideLiquidity.forEach(l => mapEntries.push({ price: l.price, label: 'Buy-side liquidity (equal highs)', strength: l.strength, type: 'liq-high' }));
+  r.liquidity.sellSideLiquidity.forEach(l => mapEntries.push({ price: l.price, label: 'Sell-side liquidity (equal lows)', strength: l.strength, type: 'liq-low' }));
+  r.roundNumbers.forEach(p => mapEntries.push({ price: p, label: 'Round number', strength: null, type: 'round' }));
+  mapEntries.sort((a, b) => Math.abs(a.price - r.price) - Math.abs(b.price - r.price));
+  const liqList = document.getElementById('liqMapList');
+  liqList.innerHTML = mapEntries.slice(0, 7).map(e => {
+    const dist = e.price - r.price;
+    const pips = Math.abs(dist) / PIP_SIZE;
+    const dirCls = e.type === 'liq-high' ? 'bullish' : e.type === 'liq-low' ? 'bearish' : 'bullish';
+    const strengthTxt = e.strength ? ' · ' + e.strength + ' touches' : '';
+    return '<div class="zone-item ' + (e.type === 'liq-low' ? 'bearish' : '') + '"><span>' + e.label + strengthTxt + '</span><span class="mono">$' + fmt(e.price) + ' (' + (dist >= 0 ? '+' : '') + pips.toFixed(0) + 'p)</span></div>';
+  }).join('') || '<div class="zone-empty">No pools detected.</div>';
+
+  const sweepEl = document.getElementById('sweepAlert');
+  if (r.sweep) { sweepEl.textContent = '⚠ ' + r.sweep.note; sweepEl.classList.remove('hidden'); }
+  else sweepEl.classList.add('hidden');
+
+  // Session & Regime
+  const si = r.sessionInfo;
+  document.getElementById('sessionBadge').innerHTML = si.marketOpen === false
+    ? '<span class="badge bearish">Closed</span> <span style="font-size:10px;color:#8a8f9c;">reopens in ' +
+      (si.hoursUntilOpen < 1 ? Math.round(si.hoursUntilOpen * 60) + 'm' : si.hoursUntilOpen.toFixed(1) + 'h') + '</span>'
+    : '<span class="badge neutral">' + si.session + '</span>';
+  document.getElementById('regimeBadge').textContent = r.regimeInfo.regime;
+  const kzEl = document.getElementById('killZoneAlert');
+  if (r.sessionInfo.killZone) { kzEl.textContent = '⚡ ' + r.sessionInfo.killZone + ' active — expect sharper, faster moves.'; kzEl.classList.remove('hidden'); }
+  else kzEl.classList.add('hidden');
+  document.getElementById('tfSourceNote').textContent = (r.mtfIsReal ? '1H: real' : '1H: aggregated') + ' · ' + (r.htfIsReal ? '4H: real' : '4H: aggregated') + ' · ' + (r.dailyIsReal ? 'Daily: real' : 'Daily: aggregated') + ' · ' + (r.weeklyIsReal ? 'Weekly: real' : 'Weekly: aggregated (thin — connect Twelve Data for a real weekly read)');
+
+  // Historical Similarity
+  const hs = document.getElementById('histSimContent');
+  if (r.histSim) {
+    hs.innerHTML = 'Found <strong style="color:#e8c37a;">' + r.histSim.count + '</strong> similar past setups (next ' + r.histSim.avgDurationBars + ' bars): '
+      + '<span class="fpos">' + r.histSim.bullishPct + '% bullish</span> / <span class="fneg">' + r.histSim.bearishPct + '% bearish</span>. '
+      + 'Avg move: ' + (r.histSim.avgMovePct >= 0 ? '+' : '') + r.histSim.avgMovePct.toFixed(2) + '%, range across outcomes: ' + r.histSim.rangePct.toFixed(2) + '%.';
+  } else {
+    hs.textContent = 'Not enough history yet to compare (needs 80+ candles of context).';
+  }
+
+  // Correlation Engine
+  const corrList = document.getElementById('correlationList');
+  if (corrList) {
+    if (!correlationDetails.length) {
+      corrList.innerHTML = '<div class="zone-empty">Enter a FRED key and/or connect Twelve Data, then hit Refresh.</div>';
+    } else {
+      corrList.innerHTML = correlationDetails.map(d => {
+        const srcTag = ' <span style="color:#454a56;font-size:9px;">[' + d.source + ']</span>';
+        if (!d.available) return '<div class="zone-item" style="border-left-color:#454a56;"><span>' + d.label + srcTag + '</span><span style="color:#454a56;font-size:10px;" title="' + (d.reason || '') + '">unavailable</span></div>';
+        const changeCls = d.pctChange >= 0 ? 'fpos' : 'fneg';
+        const corrTxt = d.corr == null ? 'n/a' : (d.corr >= 0.4 ? 'strong +' : d.corr <= -0.4 ? 'strong −' : Math.abs(d.corr) >= 0.15 ? (d.corr > 0 ? 'weak +' : 'weak −') : 'flat') + (d.corr != null ? ' (' + fmt(d.corr) + ')' : '');
+        const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
+        const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
+        // The vintage of the data, alongside the reading. This whole engine once
+        // ran for weeks on 1976-2006 observations and nothing on screen said so.
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + srcTag
+          + ' <span style="color:#454a56;">(' + corrTxt + ')</span>' + vintageHtml(d.latestDate)
+          + '</span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
+      }).join('');
+    }
+  }
+
+  // The publication date of the newest observation, coloured by how old it is.
+  // Not decoration: the entire macro stack once ran on 1976-2006 data, every
+  // number it produced looked plausible, and nothing on screen carried a date.
+  //
+  // The scale is deliberately generous — these are daily rates and monthly
+  // prints, so a week is normal and a quarter is not.
+  // Fundamental Intelligence Engine
+  const fundList = document.getElementById('fundamentalList');
+  if (fundList) {
+    if (!fundamentalDetails.length) {
+      fundList.innerHTML = '<div class="zone-empty">Enter a FRED key above, then hit Refresh.</div>';
+    } else {
+      fundList.innerHTML = fundamentalDetails.map(d => {
+        if (!d.available) return '<div class="zone-item" style="border-left-color:#454a56;"><span>' + d.label + '</span><span style="color:#454a56;font-size:10px;" title="' + (d.reason || '') + '">unavailable</span></div>';
+        const changeCls = d.pctChange >= 0 ? 'fpos' : 'fneg';
+        const confirms = d.contribution !== 0 && lastComposite && lastComposite.direction !== 'HOLD' && Math.sign(d.contribution) === (lastComposite.direction === 'BUY' ? 1 : -1);
+        const flagTxt = lastComposite && lastComposite.direction !== 'HOLD' ? (confirms ? ' <span class="fpos">✓ confirms</span>' : ' <span class="fneg">✗ contradicts</span>') : '';
+        return '<div class="zone-item ' + (d.pctChange < 0 ? 'bearish' : '') + '"><span>' + d.label + vintageHtml(d.latestDate)
+          + '</span><span class="mono ' + changeCls + '">' + (d.pctChange >= 0 ? '+' : '') + fmt(d.pctChange) + (d.kind === 'yield' ? ' pp' : '%') + flagTxt + '</span></div>';
+      }).join('');
+    }
+  }
+
+  // News Sentiment Engine
+  const newsSummaryEl = document.getElementById('newsSummary');
+  const newsListEl = document.getElementById('newsList');
+  if (newsSummaryEl && newsListEl) {
+    if (newsError) {
+      newsSummaryEl.innerHTML = '<span style="color:#454a56;">' + newsError + '</span>';
+      newsListEl.innerHTML = '';
+    } else if (!newsDetails.length) {
+      newsSummaryEl.textContent = 'Enter an Alpha Vantage key above, then hit Refresh.';
+      newsListEl.innerHTML = '';
+    } else {
+      const leanTxt = newsSentimentScore > 0.1 ? 'leans bullish for gold' : newsSentimentScore < -0.1 ? 'leans bearish for gold' : 'roughly neutral for gold';
+      const leanCls = newsSentimentScore > 0.1 ? 'fpos' : newsSentimentScore < -0.1 ? 'fneg' : 'fneu';
+      newsSummaryEl.innerHTML = 'Avg raw market sentiment: <span class="mono">' + (newsAvgScore >= 0 ? '+' : '') + newsAvgScore.toFixed(3) + '</span> across ' + newsDetails.length + ' articles → inverted reading <span class="' + leanCls + '">' + leanTxt + '</span>.';
+      newsListEl.innerHTML = newsDetails.slice(0, 8).map(a => {
+        const cls = a.sentimentScore > 0.15 ? 'fpos' : a.sentimentScore < -0.15 ? 'fneg' : 'fneu';
+        const timeTxt = a.timePublished ? a.timePublished.slice(4, 6) + '/' + a.timePublished.slice(6, 8) + ' ' + a.timePublished.slice(9, 11) + ':' + a.timePublished.slice(11, 13) : '';
+        const titleShort = a.title.length > 70 ? a.title.slice(0, 70) + '…' : a.title;
+        return '<div class="zone-item"><span style="max-width:75%;">' + titleShort + ' <span style="color:#454a56;font-size:9px;">(' + (a.source || '') + ' · ' + timeTxt + ')</span></span><span class="mono ' + cls + '">' + a.sentimentLabel + '</span></div>';
+      }).join('');
+    }
+  }
+
+  // Contrarian theses + fusion
+  const metaScoreForGrade = (r.direction !== 'HOLD' && lastPlan) ? lastPlan.metaScore : 0;
+  const displayGrade = downgradeGrade(r.fusion.grade, metaScoreForGrade);
+  document.getElementById('tradeGrade').textContent = displayGrade;
+  const metaNote = metaScoreForGrade < -0.15 ? ('meta-labeler flags this candidate as historically weak (score: ' + metaScoreForGrade.toFixed(2) + ')') : null;
+  document.getElementById('riskLevel').textContent = metaNote ? (r.fusion.riskLevel === 'Normal' ? metaNote : r.fusion.riskLevel + '; ' + metaNote) : r.fusion.riskLevel;
+  document.getElementById('bullThesis').textContent = r.fusion.theses.bull.length ? r.fusion.theses.bull.join(', ') : 'No supporting factors right now.';
+  document.getElementById('bearThesis').textContent = r.fusion.theses.bear.length ? r.fusion.theses.bear.join(', ') : 'No supporting factors right now.';
+  document.getElementById('neutralThesis').textContent = r.fusion.theses.neutral.length ? r.fusion.theses.neutral.join(', ') : 'None.';
+
+  checkFeedStaleness();
+
+  const alertEl = document.getElementById('systemAlertBanner');
+  if (alertEl) {
+    const alert = detectSystemAlert(r.factors, r.atrArr);
+    if (alert.active) { alertEl.textContent = '🔍 ' + alert.message; alertEl.classList.remove('hidden'); }
+    else alertEl.classList.add('hidden');
+  }
+
+  const metaStatusEl = document.getElementById('metaLabelerStatus');
+  if (metaStatusEl) {
+    const numExamples = (learningState.metaExamples || []).length;
+    const trained = !!(learningState.metaModel && learningState.metaModel.length);
+    metaStatusEl.textContent = trained
+      ? 'Trained on ' + numExamples + ' labeled trades (win/loss), ' + learningState.metaModel.length + ' boosted stumps in the ensemble. Retrains each backtest cycle.'
+      : 'Collecting examples: ' + numExamples + '/15 needed before the meta-labeler can train. Run a backtest or resolve live signals to build this up.';
+  }
+
+  resizeLiveCanvas();
+}
+
+// The confidence number, explained by the system's own record rather than left
+// as a bare percentage.
+//
+// Three things make it mean something, and none of them is the number itself:
+// where it sits on the scale this engine actually reaches (perfect five-timeframe
+// alignment tops out near 49%, so 45% is near the ceiling, not "below average"),
+// what signals at this level have gone on to do, and how much that record is
+// worth. When there is no record the panel says so instead of implying one.
+function renderConfidenceMeaning(result, plan) {
+  const box = document.getElementById('confidenceMeaning');
+  if (!box) return;
+  const ci = interpretConfidence(result.confidence, signalLog, {
+    calibration: computeCalibration(signalLog),
+    rr: plan ? plan.rr : null
+  });
+
+  const fill = document.getElementById('confBarFill');
+  const pct = ci.ofCeiling != null ? Math.round(ci.ofCeiling * 100) : 0;
+  fill.style.width = pct + '%';
+  // Colour by the band, not by the raw number — the whole point is that the raw
+  // number is read against the wrong scale.
+  fill.style.background = ci.band.key === 'high' ? '#3ecf8e' : ci.band.key === 'mid' ? '#e8c37a' : '#5c6270';
+
+  document.getElementById('confBandLabel').textContent =
+    result.confidence + '% — ' + ci.band.label + ' (' + pct + '% of this engine\'s realistic ceiling)';
+
+  const evTag = document.getElementById('confEvidenceTag');
+  const evColour = { none: '#ef4d5f', thin: '#ffa726', usable: '#e8c37a', solid: '#3ecf8e' }[ci.evidence];
+  evTag.textContent = ci.sampleInBand + ' resolved in band';
+  evTag.style.color = evColour;
+
+  document.getElementById('confHeadline').textContent = ci.headline;
+  document.getElementById('confDetail').textContent = ci.evidenceNote + ' ' + ci.discriminationNote;
+  document.getElementById('confMore').textContent = ci.meaning + ' ' + ci.scaleNote;
+}
+
+function updateSignalUI(result, plan, logIt, origin) {
+  const dirDisplay = document.getElementById('dirDisplay');
+  dirDisplay.className = 'dir';
+  if (result.direction === 'BUY') { dirDisplay.classList.add('buy'); dirDisplay.innerText = '📈 BUY'; }
+  else if (result.direction === 'SELL') { dirDisplay.classList.add('sell'); dirDisplay.innerText = '📉 SELL'; }
+  else { dirDisplay.classList.add('hold'); dirDisplay.innerText = '⏸ HOLD'; }
+  document.getElementById('confidenceLabel').textContent = result.confidence + '% confidence';
+  renderConfidenceMeaning(result, plan);
+  document.getElementById('sEntry').innerText = '$' + fmt(plan.entry);
+  document.getElementById('sSl').innerText = '$' + fmt(plan.sl);
+  document.getElementById('sTp').innerText = '$' + fmt(plan.tp);
+  document.getElementById('sRr').innerText = plan.rr.toFixed(2) + ':1';
+  document.getElementById('sEntryType').innerText = plan.entryType === 'market' ? 'Entry (mkt)' : 'Entry (limit)';
+  document.getElementById('sSlPips').innerText = plan.slPips.toFixed(0) + ' pips';
+  document.getElementById('sTpPips').innerText = plan.tpPips.toFixed(0) + ' pips';
+  document.getElementById('sReason').innerText = reasoningText(result, plan);
+
+  const metaBox = document.getElementById('metaLabelerBox');
+  if (result.direction !== 'HOLD' && plan.qualityFeatures) {
+    metaBox.classList.remove('hidden');
+    const trained = !!(learningState.metaModel && learningState.metaModel.length);
+    const scoreEl = document.getElementById('metaScoreValue');
+    const s = plan.metaScore || 0;
+    scoreEl.textContent = (s >= 0 ? '+' : '') + s.toFixed(2);
+    scoreEl.className = 'mono ' + (s > 0.15 ? 'fpos' : s < -0.15 ? 'fneg' : 'fneu');
+    document.getElementById('metaScoreStatus').textContent = trained
+      ? metaTrainingSummary()
+      : 'Not enough labeled trades yet (need 15+) — score is neutral until trained.';
+    document.getElementById('metaFeatureTable').innerHTML = QUALITY_FEATURE_NAMES.map((name, i) => {
+      const v = plan.qualityFeatures[i];
+      const cls = v > 0.6 ? 'fpos' : v < 0.35 ? 'fneg' : 'fneu';
+      return '<tr><td>' + name + '</td><td class="' + cls + '">' + v.toFixed(2) + '</td></tr>';
+    }).join('');
+  } else {
+    metaBox.classList.add('hidden');
+  }
+
+  const labels = FACTOR_LABELS;
+  const table = document.getElementById('factorTable');
+  table.innerHTML = Object.keys(labels).map(k => {
+    const val = result.factors[k], w = result.weights[k], contrib = (val * w / result.totalWeight * 100);
+    const cls = contrib > 1 ? 'fpos' : contrib < -1 ? 'fneg' : 'fneu';
+    const sign = contrib > 0 ? '+' : '';
+    return '<tr><td>' + labels[k] + '</td><td class="' + cls + '">' + sign + contrib.toFixed(1) + '%</td></tr>';
+  }).join('');
+
+  if (logIt && result.direction !== 'HOLD') {
+    addSignalToLog(result, plan, origin);
+  }
+}
+// Generate is the manual half of the same loop autonomous mode runs: analyse,
+// log the signal, and — with paper trading on — place the trade. It used to do
+// all of that silently, so a pass that took nothing (the engine reading HOLD, a
+// full paper book) was indistinguishable from a broken button.
+document.getElementById('genBtn').addEventListener('click', function () {
+  const btn = this; btn.disabled = true; btn.innerText = 'Analyzing...';
+  setTimeout(() => {
+    const before = signalLog.length;
+    lastPaperOutcome = null;
+    refreshAll();
+    let plan = null;
+    if (lastComposite) { plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, true); }
+    // Re-audit on every manual pass. The panel used to refresh only on boot and
+    // on autonomous cycles, so pressing Generate against a feed that had gone
+    // wrong showed a clean audit from hours earlier — the one moment the
+    // auditor most needs to be current.
+    // A market entry is live the moment it is taken; waiting up to 30s for the
+    // watch to say so makes Generate look like it did nothing.
+    advanceLiveTrades();
+    runAudit();
+    renderAudit();
+    reportGenerateOutcome(before, plan);
+    btn.disabled = false; btn.innerText = 'Generate';
+  }, 450);
+});
+
+// Connecting a provider swaps out every series the analysis stands on, so the
+// audit that described the old feed says nothing about the new one.
+function auditAfterFeedChange() {
+  try { runAudit(); renderAudit(); } catch (e) { /* audit must never break the app */ }
+}
+
+function reportGenerateOutcome(logLengthBefore, plan) {
+  const el = document.getElementById('genOutcome');
+  if (!el) return;
+  const took = signalLog.length > logLengthBefore;
+  if (!lastComposite) {
+    setGenOutcome(el, 'No analysis was produced — connect a data provider or load candles first.', 'warn');
+    return;
+  }
+  if (!took) {
+    // The engine holding is a decision, not a failure, and saying so is the
+    // whole point: nothing was logged and nothing was traded.
+    const why = lastComposite.direction === 'HOLD'
+      ? 'the engine reads HOLD — the factors are cancelling, so there is no direction to trade'
+      : 'no trade plan could be built from this read';
+    setGenOutcome(el, 'No trade taken: ' + why + '. Nothing was logged and no paper position was opened.', 'warn');
+    return;
+  }
+  const sig = signalLog[0];
+  const head = 'Logged a ' + sig.dir + ' at $' + fmt(sig.entry) + ' (' + sig.confidence + '% confidence' +
+    (sig.grade ? ', grade ' + sig.grade : '') + ').';
+  setGenOutcome(el, head + ' ' + (lastPaperOutcome || 'Paper trading is off, so no position was opened.'),
+    lastPaperOutcome && /opened|resting/.test(lastPaperOutcome) ? 'ok' : 'warn');
+}
+
+function setGenOutcome(el, text, tone) {
+  el.textContent = text;
+  el.style.color = tone === 'ok' ? '#3ecf8e' : tone === 'warn' ? '#ffa726' : '';
+}
+
+function liveTick() {
+  if (dataMode !== 'simulated') return;
+  const last = liveData[liveData.length - 1];
+  const drift = (Math.random() - 0.5) * 1.1;
+  const newClose = Math.max(1500, last.close + drift);
+  last.close = +newClose.toFixed(2); last.high = Math.max(last.high, last.close); last.low = Math.min(last.low, last.close);
+  refreshAll();
+}
+refreshAll();
+window.addEventListener('resize', resizeLiveCanvas);
+simTickHandle = setInterval(liveTick, 2000);
+if (lastComposite) { const plan = buildTradePlan(lastComposite, getTargetRR()); updateSignalUI(lastComposite, plan, false); }
+
+function drawEquityCurve(curve, capital) {
+  const canvas = document.getElementById('equityCanvas'); const ctx = canvas.getContext('2d');
+  const rect = canvas.parentElement.getBoundingClientRect();
+  const w = Math.min(rect.width - 2, window.innerWidth - 22), h = 180;
+  canvas.width = w * window.devicePixelRatio; canvas.height = h * window.devicePixelRatio;
+  canvas.style.width = w + 'px'; canvas.style.height = h + 'px';
+  ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.scale(window.devicePixelRatio, window.devicePixelRatio); ctx.clearRect(0, 0, w, h);
+  const pad = { top: 14, bottom: 14, left: 4, right: 4 }, chartW = w - pad.left - pad.right, chartH = h - pad.top - pad.bottom;
+  const values = curve.map(c => c.equity);
+  const minV = Math.min(...values, capital) * 0.98, maxV = Math.max(...values, capital) * 1.02, range = maxV - minV || 1;
+  ctx.strokeStyle = '#1a1d26'; ctx.lineWidth = 0.5;
+  for (let i = 0; i < 4; i++) { let y = pad.top + (i / 3) * chartH; ctx.beginPath(); ctx.moveTo(pad.left, y); ctx.lineTo(w - pad.right, y); ctx.stroke(); }
+  const baseY = pad.top + (maxV - capital) / range * chartH;
+  ctx.strokeStyle = '#33384a'; ctx.setLineDash([3, 3]); ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.left, baseY); ctx.lineTo(w - pad.right, baseY); ctx.stroke(); ctx.setLineDash([]);
+  const finalUp = values[values.length - 1] >= capital;
+  ctx.strokeStyle = finalUp ? '#3ecf8e' : '#ef4d5f'; ctx.lineWidth = 2; ctx.beginPath();
+  curve.forEach((c, idx) => { const x = pad.left + (idx / (curve.length - 1 || 1)) * chartW, y = pad.top + (maxV - c.equity) / range * chartH; if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+  ctx.stroke();
+}
+async function runBacktestCycle(isAuto) {
+  const btn = document.getElementById('runBtBtn');
+  if (isAuto && btn.disabled) return; // don't overlap with a manual run in progress
+  btn.disabled = true; btn.innerText = isAuto ? 'Auto-backtesting...' : 'Running walk-forward test...';
+  const autoStatus = document.getElementById('autoBacktestStatus');
+  try {
+    const baseWeights = getWeights();
+    const params = {
+      minConfidence: parseFloat(document.getElementById('pMinConf').value) || 35,
+      riskPct: parseFloat(document.getElementById('pRisk').value) || 1,
+      capital: parseFloat(document.getElementById('pCapital').value) || 10000
+    };
+    const bars = parseInt(document.getElementById('pBars').value) || 900;
+    const targetRR = parseFloat(document.getElementById('pTargetRR').value) || 4;
+    const costPips = parseFloat(document.getElementById('pCostPips').value) || 0;
+
+    let histData;
+    if (dataMode === 'live' && apiKey && activeProvider) {
+      try {
+        histData = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, Math.min(bars, 5000));
+        btSourceNote.textContent = 'Data source: ' + PROVIDERS[activeProvider].label + ' — ' + histData.length + ' × 15min candles for ' + SYMBOL + '.';
+      } catch (e) {
+        btSourceNote.textContent = 'Live history fetch failed (' + e.message + ') — using simulated data instead.';
+        histData = genData(bars, 1850, 900000);
+      }
+    } else {
+      histData = genData(bars, 1850, 900000);
+      btSourceNote.textContent = 'Data source: simulated (connect an API key above to backtest on real 15min history).';
+    }
+
+    // Pass 1: run with base weights to gather in-sample (train) trades for tuning
+    const passA = runSmcBacktest(histData, params, baseWeights, targetRR, costPips);
+    const splitIdx = Math.floor(histData.length * 0.7);
+    const trainTrades = passA.trades.filter(t => t.entryIndex < splitIdx);
+    const { tuned } = computeTunedWeights(trainTrades, baseWeights);
+
+    // Pass 2: re-run full data with tuned weights; only trades opened after the split are genuinely out-of-sample
+    const passB = runSmcBacktest(histData, params, tuned, targetRR, costPips);
+    const testTrades = passB.trades.filter(t => t.entryIndex >= splitIdx);
+
+    // Only out-of-sample outcomes feed the persisted learning system, to avoid rewarding overfit patterns
+    testTrades.forEach(t => recordOutcome(t.dir, t.factors, t.result === 'win'));
+
+    // Meta-labeler: same out-of-sample discipline. Each out-of-sample trade with a real quality-feature
+    // vector becomes a labeled example (win=1, loss=-1), capped so the training set doesn't grow unbounded.
+    // Backtest examples are regenerable — the same window can be replayed any
+    // time — so a rolling store is enough, and crucially they live apart from
+    // the live outcomes and can never evict one.
+    const newExamples = testTrades.filter(t => t.qualityFeatures).map(t => ({ features: t.qualityFeatures, label: t.result === 'win' ? 1 : -1 }));
+    learningState.metaBacktestExamples = (learningState.metaBacktestExamples || [])
+      .concat(newExamples).slice(-META_LIMITS.backtestStore);
+    retrainMetaLabeler();
+    saveLearningState();
+
+    lastWalkForward = { tuned, baseWeights };
+    const trainWR = trainTrades.length ? (trainTrades.filter(t => t.result === 'win').length / trainTrades.length * 100) : 0;
+    const testWR = testTrades.length ? (testTrades.filter(t => t.result === 'win').length / testTrades.length * 100) : 0;
+    const trainPnl = trainTrades.reduce((s, t) => s + t.pnl, 0);
+    const testPnl = testTrades.reduce((s, t) => s + t.pnl, 0);
+    document.getElementById('wfTrainTrades').textContent = trainTrades.length;
+    document.getElementById('wfTestTrades').textContent = testTrades.length;
+    document.getElementById('wfTrainWR').textContent = trainWR.toFixed(1) + '%';
+    document.getElementById('wfTestWR').textContent = testWR.toFixed(1) + '%';
+    document.getElementById('wfTrainPnl').textContent = (trainPnl >= 0 ? '+' : '') + '$' + trainPnl.toFixed(0);
+    document.getElementById('wfTestPnl').textContent = (testPnl >= 0 ? '+' : '') + '$' + testPnl.toFixed(0);
+
+    const result = passB;
+    document.getElementById('btEmpty').classList.add('hidden');
+    document.getElementById('btResults').classList.remove('hidden');
+    drawEquityCurve(result.equityCurve, params.capital);
+
+    const wins = result.trades.filter(t => t.result === 'win'), losses = result.trades.filter(t => t.result === 'loss');
+    const winRate = result.trades.length ? (wins.length / result.trades.length * 100) : 0;
+    const totalReturn = ((result.finalEquity - params.capital) / params.capital) * 100;
+    const grossWin = wins.reduce((s, t) => s + t.pnl, 0), grossLoss = Math.abs(losses.reduce((s, t) => s + t.pnl, 0));
+    const pf = grossLoss > 0 ? (grossWin / grossLoss) : (grossWin > 0 ? Infinity : 0);
+
+    document.getElementById('btTrades').innerText = result.trades.length;
+    document.getElementById('btWinrate').innerText = winRate.toFixed(1) + '%';
+    const retEl = document.getElementById('btReturn');
+    retEl.innerText = (totalReturn >= 0 ? '+' : '') + totalReturn.toFixed(1) + '%';
+    retEl.className = 'v mono ' + (totalReturn >= 0 ? 'pos' : 'neg');
+    document.getElementById('btDD').innerText = '-' + result.maxDD.toFixed(1) + '%';
+    document.getElementById('btPF').innerText = isFinite(pf) ? pf.toFixed(2) : '∞';
+    document.getElementById('btFinal').innerText = '$' + result.finalEquity.toFixed(0);
+
+    const tbody = document.getElementById('btTradeBody'); tbody.innerHTML = '';
+    result.trades.slice().reverse().forEach((t, idx) => {
+      const seg = t.entryIndex < splitIdx ? 'train' : 'test';
+      const tr = document.createElement('tr');
+      tr.innerHTML = '<td>' + (result.trades.length - idx) + '</td><td>' + seg + '</td><td>' + t.dir + '</td><td class="mono">' + t.confidence + '%</td><td class="mono">' + fmt(t.entry) + '</td><td class="mono">' + fmt(t.exit) + '</td><td class="mono ' + t.result + '">' + (t.pnl >= 0 ? '+' : '') + t.pnl.toFixed(2) + '</td><td class="' + t.result + '">' + t.result.toUpperCase() + '</td>';
+      tbody.appendChild(tr);
+    });
+    if (isAuto && autoStatus) {
+      autoStatus.textContent = 'Last auto-backtest: ' + new Date().toLocaleTimeString() + '. Next run in ~4 hours while this tab stays open and connected.';
+    }
+  } catch (e) {
+    btSourceNote.textContent = 'Backtest failed: ' + e.message;
+    if (isAuto && autoStatus) autoStatus.textContent = 'Last auto-backtest failed: ' + e.message + '. Will retry on the next cycle.';
+  }
+  btn.disabled = false; btn.innerText = 'Run Backtest';
+}
+document.getElementById('runBtBtn').addEventListener('click', () => runBacktestCycle(false));
+
+let autoBacktestHandle = null;
+function startAutoBacktest() {
+  if (autoBacktestHandle) clearInterval(autoBacktestHandle);
+  const cb = document.getElementById('autoBacktestCheckbox');
+  const status = document.getElementById('autoBacktestStatus');
+  if (!cb.checked) { status.textContent = 'Auto-backtest is off — check the box above to enable self-learning.'; return; }
+  if (dataMode !== 'live') { status.textContent = 'Connect a real data provider to enable auto-backtesting.'; return; }
+  status.textContent = 'Self-learning active — first auto-backtest running now, then every ~4 hours while this tab stays open.';
+  runBacktestCycle(true);
+  autoBacktestHandle = setInterval(() => {
+    if (document.getElementById('autoBacktestCheckbox').checked && dataMode === 'live') runBacktestCycle(true);
+  }, 4 * 60 * 60 * 1000);
+}
+document.getElementById('autoBacktestCheckbox').addEventListener('change', () => {
+  if (document.getElementById('autoBacktestCheckbox').checked) startAutoBacktest();
+  else { if (autoBacktestHandle) clearInterval(autoBacktestHandle); document.getElementById('autoBacktestStatus').textContent = 'Auto-backtest is off — check the box above to enable self-learning.'; }
+});
+
+let lastWalkForward = null;
+document.getElementById('applyWfWeightsBtn').addEventListener('click', () => {
+  if (!lastWalkForward) return;
+  const idByKey = {}; weightIds.forEach(id => { idByKey[weightKeys[id]] = id; });
+  Object.keys(lastWalkForward.tuned).forEach(k => {
+    const el = document.getElementById(idByKey[k]);
+    if (el) { el.value = lastWalkForward.tuned[k]; document.getElementById(idByKey[k] + 'V').textContent = lastWalkForward.tuned[k]; }
+  });
+  refreshAll(); renderLearningTable();
+});
+
+
+
+// ============================================================
+// DATA INVENTORY PANEL
+// ------------------------------------------------------------
+// Answers "how much has it actually learned", which nothing else here does.
+// It also shows the worker's totals alongside the browser's, because the two
+// keep SEPARATE learning stores — the browser in localStorage (and Firestore
+// under users/<uid> when signed in), the worker in Firestore under
+// system/worker. Neither reads the other, so they accumulate independently and
+// a total from one says nothing about the other.
+// ============================================================
+let workerTotals = null; // populated from the worker's public tick snapshot
+
+function bar(p, colour) {
+  return '<div style="height:4px;background:#1a1d26;border-radius:2px;overflow:hidden;margin-top:3px;">'
+    + '<div style="height:100%;width:' + p + '%;background:' + colour + ';"></div></div>';
+}
+function capRow(label, cap, unit) {
+  const colour = cap.ready ? '#3ecf8e' : cap.pct >= 50 ? '#ffa726' : '#5c6270';
+  const right = cap.ready
+    ? '<span style="color:#3ecf8e;">active</span>'
+    : '<span style="color:#9298a5;">' + cap.have + ' / ' + cap.need + ' ' + (unit || '') + '</span>';
+  return '<div style="margin-bottom:8px;">'
+    + '<div style="display:flex;justify-content:space-between;font-size:11px;">'
+    + '<span>' + label + '</span>' + right + '</div>'
+    + bar(cap.pct, colour) + '</div>';
+}
+
+function renderDataInventory() {
+  const root = document.getElementById('dataContent');
+  if (!root) return;
+  const inv = dataInventory({
+    learningState, signalLog, shadowLog, paperPositions: paper.positions
+  });
+  const st = inv.stores;
+
+  let html = '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + st.signalsResolved + '</div></div>'
+    + '<div class="card"><div class="label">Learned From</div><div class="value mono">' + st.totalLogged + '</div></div>'
+    + '<div class="card"><div class="label">Meta Examples</div><div class="value mono">' + st.metaExamples + '</div></div>'
+    + '<div class="card"><div class="label">Declined Tracked</div><div class="value mono">' + st.shadowsResolved + '</div></div>'
+    + '</div>';
+
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">What each store unlocks</div>';
+  html += capRow('Knowledge base — auto-tunes factor weights', inv.capabilities.knowledgeBase, 'outcomes');
+  html += capRow('Meta-labeler — scores setup quality', inv.capabilities.metaLabeler, 'examples');
+  html += capRow('Calibration — is confidence meaningful', inv.capabilities.calibration, 'resolved');
+  html += capRow('Gate audit — is the filter too tight', inv.capabilities.gateAudit, 'declined');
+  html += capRow('Journal insights', inv.capabilities.journal, 'resolved');
+
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Raw stores (this browser)</div>';
+  const row = (k, v, extra) => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">' + k
+    + '</span><span class="mono" style="font-size:11px;">' + v
+    + (extra ? ' <span style="color:#454a56;">' + extra + '</span>' : '') + '</span></div>';
+  html += row('Signals logged', st.signalsTotal, 'cap ' + inv.caps.signalLog);
+  html += row('&nbsp;&nbsp;· resolved / open / expired', st.signalsResolved + ' / ' + st.signalsOpen + ' / ' + st.signalsExpired, '');
+  html += row('Declined setups tracked', st.shadowsTotal, 'cap ' + inv.caps.shadowLog);
+  html += row('Meta-labeler examples', st.metaExamples, 'cap ' + inv.caps.metaExamples + (inv.metaTrained ? ' · trained' : ' · untrained'));
+  html += row('Paper trades closed / open', st.paperClosed + ' / ' + st.paperOpen, '');
+  html += row('Distinct patterns seen', st.patterns, '');
+  html += row('Factors with usable history', st.factorsWithData + ' / ' + st.factorsTotal, '5+ votes each');
+
+  if (inv.factorStats.length && inv.factorStats[0].votes > 0) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Per-factor evidence</div>';
+    html += inv.factorStats.filter(f => f.votes > 0).map(f => {
+      const wr = f.votes ? (f.wins / f.votes * 100) : null;
+      const cls = f.votes < 5 ? 'fneu' : wr >= 55 ? 'fpos' : wr <= 45 ? 'fneg' : 'fneu';
+      return '<div class="zone-item" style="padding:2px 0;"><span style="font-size:11px;">' + (FACTOR_LABELS[f.key] || f.key)
+        + '</span><span class="mono ' + cls + '" style="font-size:11px;">' + f.votes + ' votes'
+        + (f.votes >= 5 ? ' · ' + wr.toFixed(0) + '%' : ' <span style="color:#454a56;">(needs 5)</span>') + '</span></div>';
+    }).join('');
+  }
+
+  // The worker's pool is genuinely separate — showing them side by side rather
+  // than summed, because adding them would imply a shared brain that does not exist.
+  html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Background worker (separate store)</div>';
+  if (workerTotals) {
+    html += row('Outcomes learned from', workerTotals.totalLogged, '');
+    html += row('Meta examples', workerTotals.metaExampleCount, workerTotals.metaTrained ? 'trained' : 'untrained');
+    html += row('Open signals', workerTotals.openSignals, '');
+    html += row('Last tick', workerTotals.ageMin + ' min ago', '');
+  } else {
+    html += '<div class="zone-empty">No worker tick read yet — press refresh, or the worker has not run.</div>';
+  }
+  html += '<div class="conn-note" style="margin-top:6px;">The worker keeps its own learning store in Firestore and this browser keeps its own locally. They accumulate independently and neither reads the other, so these totals are not additive.</div>';
+
+  root.innerHTML = html;
+}
+
+// Read the worker's public snapshot for its side of the ledger.
+async function refreshWorkerTotals() {
+  if (!fbReady || !fbDb) return;
+  try {
+    const doc = await fbDb.collection('system').doc('latestTick').get();
+    if (!doc.exists) { workerTotals = null; return; }
+    const d = doc.data();
+    workerTotals = {
+      totalLogged: d.totalLogged || 0,
+      metaExampleCount: d.metaExampleCount || 0,
+      metaTrained: !!d.metaTrained,
+      openSignals: d.openSignals || 0,
+      ageMin: Math.round((Date.now() - (d.time || Date.now())) / 60000)
+    };
+  } catch (e) { workerTotals = null; }
+}
+
+document.getElementById('dataRefresh').addEventListener('click', async () => {
+  await refreshWorkerTotals();
+  renderDataInventory();
+});
+
+
+
+
+
+
+// Persisted state is not trustworthy input. It is written by older versions of
+// this app, survives partial writes, and can be edited by hand. A stored value
+// that is an object where an array is expected, or an array containing nulls,
+// used to throw deep inside a render — "signalLog.filter is not a function" —
+// and take a panel down with it. Every load goes through here instead.
+function asObjectArray(value, requiredKeys) {
+  if (!Array.isArray(value)) return [];
+  return value.filter(v => {
+    if (!v || typeof v !== 'object') return false;
+    return !requiredKeys || requiredKeys.every(k => v[k] !== undefined);
+  });
+}
+function asPlainObject(value) {
+  return (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+}
+
+// ============================================================
+// INDEPENDENT AUDITOR PANEL
+// ------------------------------------------------------------
+// Runs on every analysis and re-derives what it can from raw candles rather
+// than trusting the engine's own numbers. It reports; it never edits. The one
+// place it has teeth is the autonomous gate, where a critical finding blocks a
+// signal — acting on an analysis whose arithmetic is wrong is not a judgement
+// call, and the gate is the only place that distinction can be enforced.
+// ============================================================
+let lastAudit = null;
+
+function runAudit() {
+  if (!lastComposite) { lastAudit = null; return null; }
+  const provider = PROVIDERS[activeProvider];
+  lastAudit = auditAnalysis({
+    result: lastComposite,
+    plan: lastPlan || (lastComposite ? buildTradePlan(lastComposite, getTargetRR()) : null),
+    candles: liveData,
+    expectedIntervalMs: 15 * 60 * 1000,
+    now: Date.now(),
+    maxAgeMs: provider ? provider.resyncMinutes * 60 * 1000 * 3 : 45 * 60 * 1000,
+    knowledgeAssessment,
+    calibration: computeCalibration(signalLog),
+    // Everything the analysis was fed, so the auditor can check the inputs and
+    // not only the reasoning. Timeframes that disagree about the price are not
+    // the same instrument; a macro series that is frozen or months out of date
+    // is contributing a number that is no longer true.
+    series: { '15m': liveData, '1H': mtfData, '4H': htfData, Daily: dailyData, Weekly: weeklyData },
+    macroSeries: (macroSeries.drivers || []).map(d => ({ key: d.key, label: d.label, series: d.series }))
+  });
+  return lastAudit;
+}
+
+function renderAudit() {
+  const root = document.getElementById('auditContent');
+  if (!root) return;
+  const a = lastAudit;
+  if (!a) { root.innerHTML = '<div class="zone-empty">Nothing analysed yet.</div>'; return; }
+
+  const tone = a.blocking ? '#ef4d5f' : a.warnings ? '#ffa726' : '#3ecf8e';
+  let html = '<div class="event-line" style="border-left-color:' + tone + ';color:' + tone + ';font-weight:600;">'
+    + (a.blocking ? '⛔ ' : a.warnings ? '⚠️ ' : '✓ ') + a.verdict + '</div>';
+
+  html += '<div class="metrics" style="margin:10px 0;">'
+    + '<div class="card"><div class="label">Critical</div><div class="value mono ' + (a.critical ? 'fneg' : 'fneu') + '">' + a.critical + '</div></div>'
+    + '<div class="card"><div class="label">Warnings</div><div class="value mono">' + a.warnings + '</div></div>'
+    + '<div class="card"><div class="label">Notes</div><div class="value mono">' + a.notes + '</div></div>'
+    + '<div class="card"><div class="label">Blocks Trade</div><div class="value mono ' + (a.blocking ? 'fneg' : 'fpos') + '">' + (a.blocking ? 'yes' : 'no') + '</div></div>'
+    + '</div>';
+
+  if (a.findings.length) {
+    html += a.findings.map(f => {
+      const c = f.severity === 'critical' ? '#ef4d5f' : f.severity === 'warning' ? '#ffa726' : '#5c6270';
+      return '<div style="margin-bottom:8px;padding-left:8px;border-left:2px solid ' + c + ';">'
+        + '<div style="font-size:11px;color:' + c + ';font-weight:600;">' + f.title + '</div>'
+        + '<div style="font-size:11px;color:#9298a5;line-height:1.5;margin-top:2px;">' + f.detail + '</div></div>';
+    }).join('');
+  } else {
+    html += '<div class="zone-empty">Re-derived the price, R:R, stop distance and direction from raw candles — all consistent.</div>';
+  }
+
+  // The auditor's second job: policing trades that are already live. Shown
+  // separately because it is a different question — not "is this analysis
+  // sound" but "is this trade still worth having".
+  const t = lastTradeAudit;
+  html += '<div style="margin-top:14px;padding-top:10px;border-top:1px solid #1e222c;">'
+    + '<div style="font-size:10px;color:#454a56;text-transform:uppercase;letter-spacing:0.5px;margin-bottom:6px;">Live trades under audit</div>';
+  if (!t) {
+    html += '<div class="zone-empty">No live-trade review yet — it runs on each analysis pass.</div>';
+  } else {
+    const ttone = t.kills.length ? '#ef4d5f' : t.watch.length ? '#ffa726' : '#3ecf8e';
+    html += '<div class="event-line" style="border-left-color:' + ttone + ';color:' + ttone + ';">'
+      + escapeAttr(t.verdict) + '</div>';
+    if (t.findings.length) {
+      html += t.findings.map(f => {
+        const c = f.severity === 'critical' ? '#ef4d5f' : f.severity === 'warning' ? '#ffa726' : '#5c6270';
+        return '<div style="margin-top:8px;padding-left:8px;border-left:2px solid ' + c + ';">'
+          + '<div style="font-size:11px;color:' + c + ';font-weight:600;">' + escapeAttr(f.title) + '</div>'
+          + '<div style="font-size:11px;color:#9298a5;line-height:1.5;margin-top:2px;">' + escapeAttr(f.detail) + '</div></div>';
+      }).join('');
+    }
+  }
+  html += '</div>';
+  root.innerHTML = html;
+}
+
+// ============================================================
+// ACCUMULATED KNOWLEDGE
+// ------------------------------------------------------------
+// One observation per day, appended to a record that never gets thrown away.
+// The macro model is re-estimated against the whole accumulated history, so a
+// relationship becomes better established the longer it holds — and a
+// relationship that stops holding gets caught by the split-half check rather
+// than being averaged into the past.
+// ============================================================
+const KNOWLEDGE_KEY = 'smc-knowledge-v1';
+let knowledge = emptyKnowledge();
+let knowledgeAssessment = null;
+let noveltyState = null;
+
+// Every observation recorded before this marker paired a CURRENT gold day with
+// macro driver values from 1976-2006, because FRED was being asked for the
+// oldest observations in each series rather than the newest. The rows cannot be
+// repaired — the driver values are simply from the wrong decade — and they
+// cannot be told apart by day, because the day was right and only the drivers
+// were wrong. So the accumulated record is discarded once, and rebuilt from
+// data that is actually current.
+const KNOWLEDGE_SCHEMA = 2;
+let knowledgeReset = false;
+
+async function loadKnowledge() {
+  try {
+    const raw = localStorage.getItem(KNOWLEDGE_KEY);
+    if (raw) knowledge = asPlainObject(JSON.parse(raw));
+  } catch (e) { knowledge = emptyKnowledge(); }
+  if (!knowledge || !Array.isArray(knowledge.rows)) knowledge = emptyKnowledge();
+  if (knowledge.schema !== KNOWLEDGE_SCHEMA) {
+    knowledgeReset = Array.isArray(knowledge.rows) && knowledge.rows.length > 0;
+    knowledge = Object.assign(emptyKnowledge(), { schema: KNOWLEDGE_SCHEMA });
+    await saveKnowledge();
+    return;
+  }
+  // Rows drive regression maths; a null or a non-finite value poisons a whole fit.
+  knowledge.rows = asObjectArray(knowledge.rows, ['day', 'gold'])
+    .filter(r => isFinite(r.day) && isFinite(r.gold) && r.drivers && typeof r.drivers === 'object');
+  knowledge.firstSeen = asPlainObject(knowledge.firstSeen);
+  knowledge.schema = KNOWLEDGE_SCHEMA;
+}
+async function saveKnowledge() {
+  try { localStorage.setItem(KNOWLEDGE_KEY, JSON.stringify(knowledge)); }
+  catch (e) { /* storage full or unavailable — the record stops growing, nothing breaks */ }
+}
+
+// Fold today's aligned observation into the record, then re-assess.
+function accumulateKnowledge() {
+  if (!macroSeries.gold || !macroSeries.drivers.length) return;
+  const aligned = alignByDay([macroSeries.gold].concat(macroSeries.drivers.map(d => d.series)));
+  if (aligned.days.length < 2) return;
+
+  // Every overlapping day is recorded, not just the newest — a reconnect after
+  // a gap backfills what was missed instead of leaving a hole in the record.
+  for (let i = 1; i < aligned.days.length; i++) {
+    const goldPrev = aligned.columns[0][i - 1], goldNow = aligned.columns[0][i];
+    if (!isFinite(goldPrev) || !isFinite(goldNow) || goldPrev === 0) continue;
+    const drivers = {};
+    macroSeries.drivers.forEach((d, k) => {
+      const prev = aligned.columns[k + 1][i - 1], now = aligned.columns[k + 1][i];
+      if (!isFinite(prev) || !isFinite(now)) return;
+      drivers[d.key] = d.kind === 'yield' ? now - prev : (prev !== 0 ? (now - prev) / prev : 0);
+    });
+    if (!Object.keys(drivers).length) continue;
+    knowledge = recordObservation(knowledge, {
+      day: aligned.days[i], gold: (goldNow - goldPrev) / goldPrev, drivers
+    });
+  }
+  saveKnowledge();
+
+  const specs = macroSeries.drivers.map(d => ({ key: d.key, label: d.label, kind: d.kind }));
+  knowledgeAssessment = assessKnowledge(knowledge, specs);
+  const latest = knowledge.rows.length ? knowledge.rows[knowledge.rows.length - 1].drivers : null;
+  noveltyState = latest ? detectNovelty(knowledge, latest) : null;
+  renderKnowledge();
+}
+
+function maturityColour(m) {
+  return m === 'established' ? '#3ecf8e'
+    : m === 'emerging' ? '#e8c37a'
+    : m === 'decaying' || m === 'unstable' ? '#ef4d5f'
+    : '#5c6270';
+}
+function renderKnowledge() {
+  const root = document.getElementById('knowledgeContent');
+  if (!root) return;
+  const a = knowledgeAssessment;
+  // Say plainly that the record was cleared and why. A knowledge base that
+  // silently went back to zero looks like a bug, and the reason matters more
+  // than the loss.
+  const resetNote = knowledgeReset
+    ? '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-bottom:10px;">'
+      + 'Accumulated observations were cleared. Every one of them paired a current gold day with macro '
+      + 'values from 1976-2006 — FRED was being asked for the oldest observations in each series instead '
+      + 'of the newest. The record is rebuilding from data that is actually current.</div>'
+    : '';
+  if (!a) { root.innerHTML = resetNote + '<div class="zone-empty">No observations yet — connect a provider with a FRED key.</div>'; return; }
+
+  let html = resetNote + '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Days Observed</div><div class="value mono">' + (a.totalObservations || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Established</div><div class="value mono fpos">' + (a.established || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Watching</div><div class="value mono">' + (a.watching || 0) + '</div></div>'
+    + '<div class="card"><div class="label">Explains</div><div class="value mono">' + (a.ok ? (a.r2 * 100).toFixed(0) + '%' : '—') + '</div></div>'
+    + '</div>';
+
+  // Lead with whether any of this is distinguishable from noise, before any
+  // coefficient is shown — a number presented first gets believed regardless of
+  // the caveat printed under it.
+  const real = a.ok && a.modelIsReal;
+  html += '<div class="event-line" style="border-left-color:' + (real ? '#3ecf8e' : '#ffa726')
+    + ';color:' + (real ? '#9298a5' : '#ffa726') + ';">' + (real ? '' : '⚠️ ') + describeKnowledge(a) + '</div>';
+
+  if (a.ok && a.permutation && a.walkForward) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Is it noise?</div>'
+      + '<div class="zone-item"><span style="font-size:11px;">Beats reshuffled data</span>'
+      + '<span class="mono ' + (a.beatsChance ? 'fpos' : 'fneg') + '" style="font-size:11px;">p=' + a.permutation.pValue.toFixed(3) + '</span></div>'
+      + '<div class="zone-item"><span style="font-size:11px;">Out-of-sample R² <span style="color:#454a56;">(never sees what it predicts)</span></span>'
+      + '<span class="mono ' + (a.predictsOutOfSample ? 'fpos' : 'fneg') + '" style="font-size:11px;">' + (a.walkForward.r2 * 100).toFixed(1) + '%</span></div>'
+      + (a.walkForward.hitRate != null ? '<div class="zone-item"><span style="font-size:11px;">Direction correct</span>'
+        + '<span class="mono ' + (a.walkForward.hitRate > 0.55 ? 'fpos' : 'fneu') + '" style="font-size:11px;">' + (a.walkForward.hitRate * 100).toFixed(0) + '%</span></div>' : '')
+      + '<div class="zone-item"><span style="font-size:11px;">In-sample R² <span style="color:#454a56;">(flattering, not evidence)</span></span>'
+      + '<span class="mono fneu" style="font-size:11px;">' + (a.r2 * 100).toFixed(1) + '%</span></div>';
+  }
+
+  if (noveltyState && noveltyState.novel) {
+    html += '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-top:6px;">🔍 ' + noveltyState.reason
+      + ' ' + noveltyState.unusual.map(u => u.key + ': ' + u.note).join('; ') + '</div>';
+  }
+
+  if (a.drivers && a.drivers.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">What it has learned, and how firmly</div>';
+    html += a.drivers.map(d => {
+      const c = maturityColour(d.maturity);
+      const impact = isFinite(d.impactSigma) ? ((d.impactSigma >= 0 ? '+' : '') + d.impactSigma.toFixed(2) + 'σ') : '—';
+      const tTxt = isFinite(d.t) ? ' t=' + d.t.toFixed(1) : '';
+      const fdrTxt = d.survivesFdr === false ? ' <span style="color:#454a56;">(fails FDR)</span>' : '';
+      return '<div class="zone-item"><span style="font-size:11px;">' + d.label
+        + ' <span style="color:' + c + ';font-size:9px;">● ' + d.maturity + (d.trend ? ' · ' + d.trend : '') + '</span></span>'
+        + '<span class="mono" style="font-size:11px;color:' + c + ';">' + impact
+        + '<span style="color:#454a56;">' + tTxt + '</span>' + fdrTxt + '</span></div>';
+    }).join('');
+  }
+
+  html += '<div class="data-source-note" style="margin-top:9px;margin-bottom:0;">'
+    + 'Nothing is claimed below ' + KNOWLEDGE_DEFAULTS.watchingBelow + ' observations. A relationship becomes '
+    + '<em>established</em> only when it is statistically significant over the accumulated record, and is downgraded '
+    + 'to <em>decaying</em> or <em>unstable</em> when the recent half of the record stops agreeing with the earlier half.'
+    + '</div>';
+  root.innerHTML = html;
+}
+
+// ============================================================
+// MARKET REASONING PANEL
+// ============================================================
+function renderReasoning() {
+  const root = document.getElementById('reasoningContent');
+  if (!root) return;
+  if (!lastComposite) { root.innerHTML = '<div class="zone-empty">No analysis yet.</div>'; return; }
+
+  const ex = explainMarket({
+    result: lastComposite,
+    correlationDetails, fundamentalDetails,
+    newsScore: newsSentimentScore,
+    newsAvailable: !!(newsDetails && newsDetails.length),
+    newsState: currentNewsState()
+  });
+
+  const dirCls = lastComposite.direction === 'BUY' ? 'fpos' : lastComposite.direction === 'SELL' ? 'fneg' : 'fneu';
+  let html = '<div class="event-line ' + dirCls + '" style="border-left-color:#c99bff;font-size:12px;font-weight:600;">'
+    + ex.headline + '</div>';
+
+  if (ex.conflicts.length) {
+    html += ex.conflicts.map(c => '<div class="event-line" style="border-left-color:#ffa726;color:#ffa726;margin-top:6px;">⚠️ ' + c + '</div>').join('');
+  }
+
+  html += '<div style="margin-top:8px;font-size:11px;color:#9298a5;line-height:1.6;">'
+    + ex.narrative.map(n => '<div style="margin-bottom:6px;">' + n + '</div>').join('') + '</div>';
+
+  if (ex.drivers.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Dominant drivers, ranked by measured influence</div>';
+    html += ex.drivers.map(d => {
+      const cls = d.contribution > 0 ? 'fpos' : d.contribution < 0 ? 'fneg' : 'fneu';
+      const corrTxt = d.corr != null ? ' <span style="color:#454a56;">r=' + d.corr.toFixed(2) + '</span>' : '';
+      return '<div class="zone-item"><span style="font-size:11px;">' + d.label + corrTxt + '</span>'
+        + '<span class="mono ' + cls + '" style="font-size:11px;">' + (d.contribution >= 0 ? '+' : '') + d.contribution.toFixed(2) + '</span></div>';
+    }).join('');
+  }
+
+  html += '<div class="data-source-note" style="margin-top:9px;margin-bottom:0;">' + ex.confidenceNote + '</div>';
+  root.innerHTML = html;
+}
+
+// ============================================================
+// ECONOMIC RELEASE CALENDAR
+// ------------------------------------------------------------
+// Fetched through /api/calendar (FRED sends no CORS headers) and cached for
+// hours — a release schedule does not change minute to minute. The engine
+// stands aside through high-impact windows rather than trying to trade them.
+// ============================================================
+const CALENDAR_KEY = 'smc-calendar-v1';
+const CALENDAR_TTL_MS = 6 * 60 * 60 * 1000;
+let releaseCalendar = [];
+let calendarFetchedAt = 0;
+
+async function loadCalendarCache() {
+  try {
+    const raw = localStorage.getItem(CALENDAR_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    releaseCalendar = saved.calendar || [];
+    calendarFetchedAt = saved.fetchedAt || 0;
+  } catch (e) { /* fetch fresh */ }
+}
+async function refreshCalendar(force) {
+  const fredKey = (document.getElementById('fredKeyInput') || {}).value || '';
+  if (!fredKey.trim()) return;
+  if (!force && Date.now() - calendarFetchedAt < CALENDAR_TTL_MS && releaseCalendar.length) return;
+  try {
+    const r = await fetch('/api/calendar?api_key=' + encodeURIComponent(fredKey.trim()));
+    const j = await r.json();
+    if (j.error || !Array.isArray(j.calendar)) return;
+    releaseCalendar = j.calendar;
+    calendarFetchedAt = Date.now();
+    try { localStorage.setItem(CALENDAR_KEY, JSON.stringify({ calendar: releaseCalendar, fetchedAt: calendarFetchedAt })); }
+    catch (e) { /* storage unavailable */ }
+  } catch (e) { /* the calendar is an enhancement; never block analysis on it */ }
+  renderCalendar();
+}
+function newsConfig() {
+  const num = (id, fb) => { const v = parseFloat((document.getElementById(id) || {}).value); return isFinite(v) ? v : fb; };
+  const impacts = ((document.getElementById('newsBlockMedium') || {}).checked) ? ['high', 'medium'] : ['high'];
+  return {
+    enabled: (document.getElementById('newsBlockEnabled') || { checked: true }).checked,
+    beforeMin: num('newsBeforeMin', NEWS_WINDOW_DEFAULTS.beforeMin),
+    afterMin: num('newsAfterMin', NEWS_WINDOW_DEFAULTS.afterMin),
+    blockImpacts: impacts,
+    flattenEnabled: (document.getElementById('newsFlattenEnabled') || { checked: true }).checked,
+    flattenMin: num('newsFlattenMin', NEWS_WINDOW_DEFAULTS.flattenMin),
+    flattenImpacts: impacts,
+    alertMin: num('newsAlertMin', NEWS_WINDOW_DEFAULTS.alertMin)
+  };
+}
+function currentNewsState() {
+  return newsWindowState(releaseCalendar, Date.now(), newsConfig());
+}
+
+// Close everything ahead of a scheduled release.
+//
+// Standing aside from NEW trades was only half the protection: a position
+// already open rides into the print, and NFP routinely moves gold further in
+// ninety seconds than a normal stop is wide, with the spread widening at the
+// same moment so the stop fills well past its level. Whatever comes out of that
+// says nothing about whether the setup was sound.
+//
+// The money is booked — the position really was closed at the market — but the
+// SIGNAL is marked expired, not won or lost, so it never reaches the learning
+// loop as a verdict. Same principle as the kill switch.
+function flattenForNews() {
+  const st = currentNewsState();
+  const due = signalsToFlatten(signalLog, st);
+  if (!due.length) return 0;
+  const price = currentMarkPrice();
+  let done = 0;
+  due.forEach(item => {
+    const sig = signalLog.find(x => x.id === item.id);
+    if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
+    // A resting order is cancelled; a filled one is closed at the market. Both
+    // go through the same paper path, which already books a pending order as
+    // cancelled with no P&L and an open one at the mark.
+    paperCloseForSignal(sig.id, 'expired', isFinite(price) ? price : undefined);
+    sig.status = 'expired';
+    sig.expiryReason = item.reason;
+    sig.killSwitch = 'news-flatten';
+    sig.flattenedFor = item.release;
+    sig.resolvedAt = new Date().toISOString();
+    sig.resolvedBy = 'news';
+    done++;
+  });
+  if (done) {
+    saveSignalLog();
+    renderSignalLog();
+    renderPaper();
+    renderAutonomyStats();
+    renderDataInventory();
+  }
+  return done;
+}
+// The same sweep as flattenForNews, on the other trigger. Kept separate rather
+// than folded in: a news flatten is about one scheduled event and names it, a
+// weekend flatten is about the calendar and applies to everything, and the two
+// have to be distinguishable in the log afterwards.
+function flattenForWeekend() {
+  const now = Date.now();
+  const st = weekendFlattenState(now, weekendFlattenConfig());
+  const due = signalsToFlattenForWeekend(signalLog, st, now);
+  if (!due.length) return 0;
+  const price = currentMarkPrice();
+  let done = 0;
+  due.forEach(item => {
+    const sig = signalLog.find(x => x.id === item.id);
+    if (!sig || (sig.status !== 'pending' && sig.status !== 'open')) return;
+    paperCloseForSignal(sig.id, 'expired', isFinite(price) ? price : undefined);
+    sig.status = 'expired';
+    sig.expiryReason = item.reason;
+    sig.killSwitch = 'weekend-flatten';
+    sig.resolvedAt = new Date().toISOString();
+    sig.resolvedBy = 'weekend';
+    done++;
+  });
+  if (done) {
+    saveSignalLog();
+    renderSignalLog();
+    renderPaper();
+    renderAutonomyStats();
+    renderDataInventory();
+  }
+  return done;
+}
+
+function weekendFlattenConfig() {
+  const el = document.getElementById('weekendFlattenMin');
+  const mins = el ? parseFloat(el.value) : NaN;
+  const on = document.getElementById('weekendFlattenEnabled');
+  return {
+    enabled: on ? !!on.checked : true,
+    beforeMin: isFinite(mins) && mins >= 0 ? mins : undefined
+  };
+}
+
+// One notification per release, tracked by its timestamp so a re-render or a
+// heartbeat cannot fire it repeatedly.
+let notifiedReleases = {};
+function maybeNotifyRelease(st, text) {
+  const ev = st && (st.flattenRelease || st.alertRelease);
+  if (!ev || !text) return;
+  const key = ev.name + '@' + ev.at + (st.flatten ? ':flatten' : ':alert');
+  if (notifiedReleases[key]) return;
+  notifiedReleases[key] = true;
+  // Keep the map from growing without bound over a long unattended run.
+  const keys = Object.keys(notifiedReleases);
+  if (keys.length > 40) { notifiedReleases = {}; notifiedReleases[key] = true; }
+  try {
+    if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+    new Notification(st.flatten ? 'Closing positions before ' + ev.name : 'Upcoming: ' + ev.name, { body: text });
+  } catch (e) { /* notifications unavailable or blocked — the banner still shows */ }
+}
+
+// Checked on its own timer rather than only inside an analysis cycle. The cycle
+// can be 15 minutes apart, and a release does not wait for it; a position must
+// not still be open because the next heartbeat had not come round yet.
+const NEWS_WATCH_MS = 30 * 1000;
+let newsWatchHandle = null;
+// Browser notifications need a user gesture to ask. Ticking the box that makes
+// the system close positions on its own is exactly the moment to offer it.
+function requestReleaseNotifications() {
+  try {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'default') Notification.requestPermission();
+  } catch (e) { /* not available in this context */ }
+}
+
+// Advance every live trade: fill resting orders price has reached, grade the
+// ones that hit a stop or target, cull the stale, run the auditor over the book.
+//
+// This used to happen ONLY inside the autonomous cycle. With autonomy off, a
+// signal generated by hand opened a paper order — most plans are a limit,
+// "retrace into order block" — and then nothing ever touched it again. It could
+// not fill, could not resolve, could not be killed. It simply rested forever
+// while the account showed no open positions and no P&L, which reads exactly
+// like paper trading having ignored the trade.
+//
+// Manual trading is a first-class path, so the resolver runs on its own cadence
+// for everyone. resolveOpenSignals only acts on pending/open signals, so
+// overlapping with an autonomous cycle is harmless.
+function advanceLiveTrades() {
+  if (dataMode !== 'live') return 0;          // simulated candles are not a market
+  if (!liveData || liveData.length < 2) return 0;
+  if (!signalLog.some(s => s.status === 'pending' || s.status === 'open')) return 0;
+  return resolveOpenSignals(liveData, autonomyConfig());
+}
+
+function startNewsWatch() {
+  if (newsWatchHandle) clearInterval(newsWatchHandle);
+  const pass = () => {
+    try {
+      flattenForNews();
+      flattenForWeekend();
+      advanceLiveTrades();
+      reconcilePaper();
+      renderCalendar();
+      // Nothing refreshes over a closed weekend, so without its own tick the
+      // header would still be showing Friday's state on Sunday afternoon.
+      renderMarketClock();
+    } catch (e) { /* never let the watch die on one bad pass */ }
+  };
+  // Immediately, not in thirty seconds. A release can already be minutes away
+  // when the page opens — the tab may have been closed through the whole
+  // approach — and waiting for the first tick would leave positions exposed
+  // through exactly the window this exists to clear.
+  pass();
+  newsWatchHandle = setInterval(pass, NEWS_WATCH_MS);
+}
+
+function renderCalendar() {
+  const banner = document.getElementById('newsBanner');
+  const list = document.getElementById('calendarList');
+  if (!banner || !list) return;
+  const st = currentNewsState();
+
+  // The alert comes first and reaches furthest out. Positions being closed is
+  // the most consequential thing this system does on its own, so it is
+  // announced before it happens rather than discovered afterwards.
+  const alertTxt = newsAlertText(st, newsConfig());
+  if (st.flatten || st.alert) {
+    const live = signalLog.filter(x => x.status === 'pending' || x.status === 'open').length;
+    banner.classList.remove('hidden');
+    banner.innerHTML = (st.flatten ? '🚨 ' : '⏳ ') + '<strong>' + escapeAttr(alertTxt) + '</strong>'
+      + (live ? '<br><span style="font-size:10px;">' + live + ' live trade(s) ' + (st.flatten ? 'being closed now.' : 'will be closed.') + '</span>' : '');
+    banner.style.background = st.flatten ? '#2a0d10' : '#2a1408';
+    banner.style.borderColor = st.flatten ? '#6a1f26' : '#5a3a12';
+    banner.style.color = st.flatten ? '#ef4d5f' : '#ffa726';
+  } else if (st.active) {
+    const mins = Math.round(Math.abs(st.active.minutesUntil));
+    const when = st.active.phase === 'before' ? 'in ' + mins + ' min' : mins + ' min ago';
+    banner.classList.remove('hidden');
+    banner.innerHTML = (st.blocked ? '⛔ ' : '⚠️ ') + '<strong>' + st.active.name + '</strong> ' + when
+      + ' — ' + (st.blocked ? 'no new positions through this window.' : 'expect wider spreads.');
+    banner.style.background = st.blocked ? '#2a1408' : '#1c1030';
+    banner.style.borderColor = st.blocked ? '#5a3a12' : '#3a2a5a';
+    banner.style.color = st.blocked ? '#ffa726' : '#c99bff';
+  } else {
+    banner.classList.add('hidden');
+  }
+
+  // A desktop notification for the alert, once per release. The banner is no
+  // use to someone who has left the tab running in the background, which is
+  // precisely how this app is meant to be used.
+  maybeNotifyRelease(st, alertTxt);
+
+  if (!releaseCalendar.length) {
+    list.innerHTML = '<div class="zone-empty">No calendar loaded — needs a FRED key (the same one the correlation engine uses).</div>';
+    return;
+  }
+  const soon = releaseCalendar.filter(e => e.at > Date.now() - 6 * 3600 * 1000).slice(0, 8);
+  list.innerHTML = soon.map(e => {
+    const mins = (e.at - Date.now()) / 60000;
+    const when = mins < 0 ? Math.round(-mins) + 'm ago'
+      : mins < 90 ? 'in ' + Math.round(mins) + 'm'
+      : mins < 60 * 48 ? 'in ' + Math.round(mins / 60) + 'h'
+      : new Date(e.at).toLocaleDateString([], { month: 'short', day: 'numeric' });
+    const colour = e.impact === 'high' ? '#ef4d5f' : '#5c6270';
+    return '<div class="zone-item"><span><span style="color:' + colour + ';font-size:9px;">●</span> ' + e.name
+      + '</span><span class="mono" style="font-size:11px;color:#9298a5;">' + when + '</span></div>';
+  }).join('');
+}
+document.getElementById('refreshCalendarBtn').addEventListener('click', () => refreshCalendar(true));
+['newsBlockEnabled', 'newsBeforeMin', 'newsAfterMin', 'newsBlockMedium'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', renderCalendar);
+});
+
+// ============================================================
+// PAPER TRADING ACCOUNT
+// ------------------------------------------------------------
+// A simulated account attached to the signals the engine already produces. No
+// broker, no money, no orders leave this page — it exists to turn "62% of
+// signals won" into "this would have been up 4.3% with an 11% drawdown", which
+// is the number that actually tells you whether the analysis is worth anything.
+//
+// It is off until switched on, and independent of autonomous mode: signals
+// generated by hand get paper positions too.
+//
+// Positions are opened and closed by the SIGNAL's lifecycle, never their own.
+// The signal already resolves against real candles and records the outcome for
+// learning; a position that also reported would double-count every trade in the
+// factor statistics.
+// ============================================================
+const PAPER_KEY = 'smc-paper-v1';
+
+function paperConfig() {
+  const num = (id, fb) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fb;
+  };
+  const mode = (document.getElementById('pSizingMode') || {}).value;
+  return Object.assign({}, PAPER_DEFAULTS, {
+    startingBalance: num('pStartBalance', PAPER_DEFAULTS.startingBalance),
+    riskPercent: num('pRiskPct', PAPER_DEFAULTS.riskPercent),
+    spreadPips: num('pSpread', PAPER_DEFAULTS.spreadPips),
+    slippagePips: num('pSlippage', PAPER_DEFAULTS.slippagePips),
+    maxConcurrent: num('pMaxPos', PAPER_DEFAULTS.maxConcurrent),
+    sizingMode: mode === 'fixed' ? 'fixed' : PAPER_DEFAULTS.sizingMode,
+    fixedLots: num('pFixedLots', PAPER_DEFAULTS.fixedLots),
+    contractSize: num('pContractSize', PAPER_DEFAULTS.contractSize),
+    lotStep: num('pLotStep', PAPER_DEFAULTS.lotStep),
+    minLots: num('pMinLots', PAPER_DEFAULTS.minLots)
+  });
+}
+// Partial take-profit config, read from the same panel. Lives on the resolver
+// rather than the account because it decides when a SIGNAL is closed, which is
+// what both the P&L and the learning record derive from.
+function partialTPConfig() {
+  const el = document.getElementById('pPartialPct');
+  const meta = document.getElementById('pHoldMeta');
+  const on = document.getElementById('pPartialEnabled');
+  const pctVal = el ? parseFloat(el.value) : NaN;
+  const metaVal = meta ? parseFloat(meta.value) : NaN;
+  return {
+    enabled: on ? !!on.checked : PARTIAL_TP_DEFAULTS.enabled,
+    fraction: isFinite(pctVal) ? pctVal / 100 : PARTIAL_TP_DEFAULTS.fraction,
+    holdIfMetaScore: isFinite(metaVal) ? metaVal : PARTIAL_TP_DEFAULTS.holdIfMetaScore,
+    holdIfGrades: PARTIAL_TP_DEFAULTS.holdIfGrades
+  };
+}
+async function loadPaper() {
+  try {
+    const raw = localStorage.getItem(PAPER_KEY);
+    if (raw) paper = Object.assign(paper, asPlainObject(JSON.parse(raw)));
+  } catch (e) { /* fresh account */ }
+  paper.positions = asObjectArray(paper.positions, ['id']);
+  paper.epoch = normaliseEpoch(paper.epoch);
+  if (!isFinite(paper.startingBalance)) paper.startingBalance = PAPER_DEFAULTS.startingBalance;
+  if (typeof paper.manual !== 'boolean') paper.manual = true;
+  const cb = document.getElementById('paperEnabled');
+  if (cb) cb.checked = !!paper.enabled;
+  const mcb = document.getElementById('paperManual');
+  if (mcb) mcb.checked = !!paper.manual;
+  renderPaperManualHint();
+  // The status line only ever updated on a click, so a restored account came
+  // back reading "Off" while it was actually running.
+  renderPaperStatusNote();
+}
+
+// The signal panel's toggle has to say what it will actually do, because it
+// depends on a switch in a different panel: ticking it while the paper account
+// is off would otherwise look broken. So ticking it turns the account on.
+function renderPaperManualHint() {
+  const hint = document.getElementById('paperManualHint');
+  if (!hint) return;
+  if (!paper.manual) hint.textContent = ' — they will be logged and graded, but no position is opened.';
+  else if (!paper.enabled) hint.textContent = ' — this will switch the paper account on.';
+  else hint.textContent = ' — simulated only, no orders leave this page.';
+}
+async function savePaper() {
+  try { localStorage.setItem(PAPER_KEY, JSON.stringify(paper)); } catch (e) { /* storage unavailable */ }
+}
+function currentMarkPrice() {
+  return liveData.length ? liveData[liveData.length - 1].close : NaN;
+}
+function paperBalance() {
+  const cfg = paperConfig();
+  return paperAccountSummary(paper.positions, cfg.startingBalance, currentMarkPrice(), paper.epoch).balance;
+}
+
+// Called when a signal is logged. Sizing uses the balance at that moment, so
+// the account compounds (or shrinks) as it goes rather than sizing off a
+// constant, which is what makes drawdown meaningful.
+function paperOpenForSignal(sig) {
+  if (!shouldPaperTrade(sig, paper)) {
+    lastPaperOutcome = !paper.enabled
+      ? 'Paper trading is off, so no position was opened.'
+      : 'Paper trading is on for the engine\'s own signals only — this one was generated by hand and excluded.';
+    return null;
+  }
+  const cfg = paperConfig();
+  const account = { balance: paperBalance(), positions: paper.positions };
+  const refusal = paperRejectReason(sig, account, cfg);
+  if (refusal) { lastPaperOutcome = 'No paper position opened: ' + refusal + '.'; return null; }
+  const pos = openPaperPosition(sig, account, cfg);
+  if (!pos) { lastPaperOutcome = 'No paper position opened — the account refused the trade.'; return null; }
+  // Report the risk actually taken, and say so when the lot step moved it away
+  // from what was asked for — that gap is real on every live account.
+  const asked = pos.requestedRisk;
+  const gap = (isFinite(asked) && Math.abs(asked - pos.riskAmount) > 0.01)
+    ? ' (asked for $' + asked.toFixed(2) + '; the ' + paperConfig().lotStep + '-lot step moved it)'
+    : '';
+  lastPaperOutcome = (pos.status === 'pending'
+    ? 'Paper order resting at $' + fmt(pos.requestedEntry) + ' — no exposure until price reaches it.'
+    : 'Paper position opened at $' + fmt(pos.entryFill) + '.') +
+    ' ' + lotLabel(pos) + ' (' + pos.units.toFixed(2) + ' oz), risking $' + (pos.riskAmount || 0).toFixed(2) + gap + '.';
+  paper.positions.unshift(pos);
+  paper.positions = thinPositions(paper.positions, PAPER_HISTORY_SOFT_LIMIT);
+  savePaper();
+  renderPaper();
+  renderSignalLog(); // the log row carries this position's state
+  return pos;
+}
+// Bring the paper book back into step with the signal log.
+//
+// Runs on load and on every watch pass, because the two can drift whenever a
+// resolution happens somewhere this tab was not: the worker closes a trade while
+// the tab is shut, and on the next load the signal is already `won` so the
+// newly-resolved diff has nothing to report and the position stays open.
+function reconcilePaper() {
+  if (!paper.positions.length || !signalLog.length) return 0;
+  const actions = reconcilePaperBook(paper.positions, signalLog);
+  if (!actions.length) return 0;
+  const price = currentMarkPrice();
+  actions.forEach(a => {
+    const idx = paper.positions.findIndex(p => p.id === a.id);
+    if (idx === -1) return;
+    const at = a.action === 'close' && isFinite(a.exitPrice) ? a.exitPrice
+      : (isFinite(price) ? price : undefined);
+    paper.positions[idx] = closePaperPosition(paper.positions[idx], a.outcome, price, paperConfig(), at);
+    paper.positions[idx].closeReason = 'reconciled: ' + a.reason;
+  });
+  savePaper();
+  renderPaper();
+  setWorkerLogNote('Paper book reconciled — ' + actions.length +
+    ' position(s) were still open against finished signals.');
+  return actions.length;
+}
+
+function paperCloseForSignal(signalId, outcome, atPrice) {
+  if (!paper.positions.length) return;
+  // Pending too: an unfilled order still has to be cancelled, or it lingers
+  // forever as a slot nothing can ever close.
+  const idx = paper.positions.findIndex(p => p.signalId === signalId && (p.status === 'open' || p.status === 'pending'));
+  if (idx === -1) return;
+  paper.positions[idx] = closePaperPosition(paper.positions[idx], outcome, currentMarkPrice(), paperConfig(), atPrice);
+  savePaper();
+  renderPaper();
+  renderSignalLog();
+}
+
+// The signal's limit entry was tagged — the resting order is now a position.
+function paperFillForSignal(signalId, atTime) {
+  if (!paper.positions.length) return;
+  const idx = paper.positions.findIndex(p => p.signalId === signalId && p.status === 'pending');
+  if (idx === -1) return;
+  paper.positions[idx] = fillPaperPosition(paper.positions[idx], atTime);
+  savePaper();
+  renderPaper();
+  renderSignalLog();
+}
+
+// Size as a broker would quote it. Positions opened before lots existed carry
+// only ounces, so the lot count is derived rather than assumed present.
+function lotLabel(p) {
+  const contract = p.contractSize > 0 ? p.contractSize : PAPER_DEFAULTS.contractSize;
+  const lots = isFinite(p.lots) ? p.lots : (isFinite(p.units) ? p.units / contract : null);
+  if (lots == null) return '';
+  return lots.toFixed(2) + ' lot' + (Math.abs(lots - 1) < 1e-9 ? '' : 's');
+}
+
+function money(v) {
+  if (v == null || !isFinite(v)) return '—';
+  const sign = v < 0 ? '-' : '';
+  return sign + '$' + Math.abs(v).toFixed(2);
+}
+function renderPaper() {
+  const root = document.getElementById('paperContent');
+  if (!root) return;
+  const cfg = paperConfig();
+  const price = currentMarkPrice();
+  const a = paperAccountSummary(paper.positions, cfg.startingBalance, price, paper.epoch);
+
+  const pnlCls = v => v > 0 ? 'fpos' : v < 0 ? 'fneg' : 'fneu';
+  let html = '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Equity</div><div class="value mono ' + pnlCls(a.equity - a.startingBalance) + '">' + money(a.equity) + '</div></div>'
+    + '<div class="card"><div class="label">Return</div><div class="value mono ' + pnlCls(a.returnPct) + '">' + (a.returnPct >= 0 ? '+' : '') + a.returnPct.toFixed(2) + '%</div></div>'
+    + '<div class="card"><div class="label">Max DD</div><div class="value mono">' + (a.maxDrawdown * 100).toFixed(1) + '%</div></div>'
+    + '<div class="card"><div class="label">Open</div><div class="value mono">' + a.openCount + (a.pendingCount ? ' <span style="font-size:10px;color:#5c6270;">+' + a.pendingCount + ' resting</span>' : '') + '</div></div>'
+    + '</div>';
+
+  html += '<div class="zone-item"><span>Balance (realised)</span><span class="mono ' + pnlCls(a.realised) + '">' + money(a.balance) + ' <span style="color:#454a56;">(' + (a.realised >= 0 ? '+' : '') + money(a.realised).replace('$','$') + ')</span></span></div>';
+  if (a.openCount) html += '<div class="zone-item"><span>Floating P&amp;L</span><span class="mono ' + pnlCls(a.floating) + '">' + money(a.floating) + '</span></div>';
+  html += '<div class="zone-item"><span>Closed trades</span><span class="mono">' + a.closedCount + (a.winRate != null ? ' · ' + (a.winRate * 100).toFixed(0) + '% won' : '') + '</span></div>';
+  if (a.profitFactor != null) html += '<div class="zone-item"><span>Profit factor</span><span class="mono ' + pnlCls(a.profitFactor - 1) + '">' + (a.profitFactor === Infinity ? '∞' : a.profitFactor.toFixed(2)) + '</span></div>';
+  if (a.avgR != null) html += '<div class="zone-item"><span>Average R per trade</span><span class="mono ' + pnlCls(a.avgR) + '">' + (a.avgR >= 0 ? '+' : '') + a.avgR.toFixed(2) + 'R</span></div>';
+
+  // After a reset the balance starts again but the evidence does not. Showing
+  // only the current era would make a reset look like the system had never
+  // traded, which is the opposite of what the record is for.
+  if (a.archivedCount) {
+    const lt = a.lifetime;
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Lifetime record — every trade, across resets</div>';
+    html += '<div class="zone-item"><span>Graded trades</span><span class="mono">' + lt.gradedCount
+      + (lt.winRate != null ? ' · ' + (lt.winRate * 100).toFixed(0) + '% won' : '')
+      + (lt.cutShortCount ? ' <span style="color:#454a56;">(+' + lt.cutShortCount + ' cut short)</span>' : '') + '</span></div>';
+    if (lt.avgR != null) html += '<div class="zone-item"><span>Lifetime average R</span><span class="mono ' + pnlCls(lt.avgR) + '">' + (lt.avgR >= 0 ? '+' : '') + lt.avgR.toFixed(2) + 'R</span></div>';
+    html += '<div class="zone-item"><span>Net P&amp;L across all eras</span><span class="mono ' + pnlCls(lt.netPnl) + '">' + money(lt.netPnl) + '</span></div>';
+    html += '<div style="font-size:10px;color:#454a56;margin-top:6px;line-height:1.4;">'
+      + a.archivedCount + ' trade(s) from before the last reset are excluded from the balance and drawdown above, '
+      + 'but still count here and still train the system.</div>';
+  }
+
+  // The lists below show the live book and the current era's results; archived
+  // trades are summarised above rather than listed twice. Same predicate the
+  // summary uses — a second copy of this drifted from it once already.
+  const inEra = (p) => isInEra(p, paper.epoch);
+  const resting = paper.positions.filter(p => p.status === 'pending' && inEra(p));
+  if (resting.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Awaiting entry (no exposure yet)</div>';
+    html += resting.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' limit @ $' + fmt(p.requestedEntry)
+      + '</span><span class="mono" style="color:#5c6270;">not filled</span></div>').join('');
+  }
+
+  const open = paper.positions.filter(p => p.status === 'open' && inEra(p));
+  if (open.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Open positions</div>';
+    html += open.map(p => {
+      const u = unrealisedPnl(p, price);
+      return '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + lotLabel(p) + ' @ $' + fmt(p.entryFill) + '</span>'
+        + '<span class="mono ' + pnlCls(u) + '">' + money(u) + '</span></div>';
+    }).join('');
+  }
+
+  const closed = paper.positions.filter(p => p.status === 'closed' && inEra(p)).slice(0, 8);
+  if (closed.length) {
+    html += '<div style="font-size:10px;color:#454a56;margin:10px 0 6px;">Recent closed</div>';
+    html += closed.map(p =>
+      '<div class="zone-item"><span><span class="dirtag ' + p.dir + '">' + p.dir + '</span> ' + (p.outcome === 'won' ? (p.partial ? '◐' : '✓') : p.outcome === 'lost' ? '✗' : '–')
+      + ' <span style="color:#454a56;">' + lotLabel(p) + ' · exit $' + fmt(p.exitPrice) + '</span></span>'
+      + '<span class="mono ' + pnlCls(p.pnl) + '">' + money(p.pnl) + (p.rMultiple != null ? ' <span style="color:#454a56;">' + (p.rMultiple >= 0 ? '+' : '') + fmt(p.rMultiple) + 'R</span>' : '') + '</span></div>'
+    ).join('');
+  }
+
+  if (!resting.length && !open.length && !closed.length) {
+    html += '<div class="zone-empty">' + (a.archivedCount
+      ? 'Account reset — no trades in this era yet. The record above is intact.'
+      : 'No paper trades yet. Positions open automatically as the engine logs signals.') + '</div>';
+  }
+  root.innerHTML = html;
+}
+
+function renderPaperStatusNote() {
+  const note = document.getElementById('paperStatus');
+  if (!note) return;
+  if (!paper.enabled) { note.textContent = 'Off — no positions will be opened.'; return; }
+  note.textContent = paper.manual
+    ? 'On — new signals will open simulated positions. No real orders are placed.'
+    : 'On for the engine\'s own signals. Signals you generate by hand are excluded (signal panel).';
+}
+
+document.getElementById('paperEnabled').addEventListener('change', function () {
+  paper.enabled = this.checked;
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+
+const paperManualCb = document.getElementById('paperManual');
+if (paperManualCb) paperManualCb.addEventListener('change', function () {
+  paper.manual = this.checked;
+  // Ticking it with the account off is a request to paper-trade, so honour it
+  // rather than silently doing nothing.
+  if (paper.manual && !paper.enabled) {
+    paper.enabled = true;
+    const master = document.getElementById('paperEnabled');
+    if (master) master.checked = true;
+  }
+  savePaper();
+  renderPaper();
+  renderPaperStatusNote();
+  renderPaperManualHint();
+});
+document.getElementById('paperAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('paperAdvanced').classList.toggle('hidden');
+});
+['pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos', 'pPartialPct', 'pHoldMeta', 'pPartialEnabled'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { paper.startingBalance = paperConfig().startingBalance; savePaper(); renderPaper(); });
+});
+document.getElementById('paperReset').addEventListener('click', async () => {
+  const price = currentMarkPrice();
+  const live = paper.positions.filter(p => p.status === 'open' || p.status === 'pending').length;
+  const keeping = paper.positions.filter(p => p.status === 'closed').length;
+  const msg = 'Reset the paper account back to $' + fmt(paperConfig().startingBalance) + '?\n\n'
+    + (live ? live + ' live position(s) will be closed at the current price first.\n' : '')
+    + keeping + ' completed trade(s) stay on record — they are what the system learns from, '
+    + 'and they keep counting towards the lifetime win rate. They just stop counting towards the balance.';
+  if (!window.confirm(msg)) return;
+  const out = resetPaperAccount(paper.positions, isFinite(price) ? price : undefined, Date.now());
+  paper.positions = out.positions;
+  paper.epoch = out.epoch;
+  await savePaper();
+  renderPaper();
+  renderDataInventory();
+});
+
+// ============================================================
+// ANALYSIS QUALITY PANEL
+// ------------------------------------------------------------
+// Renders the three self-audits. Every number here is deliberately allowed to
+// say "not enough data yet" rather than show a confident-looking figure built
+// on four trades — a reassuring number from a tiny sample is worse than no
+// number, because it gets believed.
+// ============================================================
+function fmtR(v) { return v == null ? '—' : (v >= 0 ? '+' : '') + v.toFixed(2) + 'R'; }
+function fmtPct(v) { return v == null ? '—' : (v * 100).toFixed(0) + '%'; }
+function rClass(v) { return v == null ? 'fneu' : v > 0.05 ? 'fpos' : v < -0.05 ? 'fneg' : 'fneu'; }
+
+function renderAnalysisQuality() {
+  const root = document.getElementById('qualityContent');
+  if (!root) return;
+
+  const cal = computeCalibration(signalLog);
+  const bd = computeConditionBreakdown(signalLog);
+  const audit = computeGateAudit(signalLog, shadowLog);
+
+  const rows = (list, label) => {
+    const usable = list.filter(r => r.n >= 3);
+    if (!usable.length) return '<div class="zone-empty">' + label + ': not enough resolved trades yet (need 3+ per group).</div>';
+    return usable.map(r =>
+      '<div class="zone-item"><span>' + r.key + ' <span style="color:#454a56;">(' + r.n + ')</span></span>' +
+      '<span class="mono ' + rClass(r.expectancyR) + '">' + fmtR(r.expectancyR) + ' · ' + fmtPct(r.winRate) + '</span></div>'
+    ).join('');
+  };
+
+  const o = bd.overall;
+  let html = '';
+
+  html += '<div class="data-source-note" style="margin-bottom:8px;">Expectancy is shown in R — average profit per unit risked. At a 1:4 target a 30% win rate is already profitable, so win rate alone is a poor scorecard and R is the honest one.</div>';
+
+  html += '<div class="metrics" style="margin-bottom:10px;">'
+    + '<div class="card"><div class="label">Resolved</div><div class="value mono">' + o.n + '</div></div>'
+    + '<div class="card"><div class="label">Win Rate</div><div class="value mono">' + fmtPct(o.winRate) + '</div></div>'
+    + '<div class="card"><div class="label">Expectancy</div><div class="value mono ' + rClass(o.expectancyR) + '">' + fmtR(o.expectancyR) + '</div></div>'
+    + '<div class="card"><div class="label">Total</div><div class="value mono ' + rClass(o.totalR) + '">' + fmtR(o.totalR) + '</div></div>'
+    + '</div>';
+
+  // 1. Is the confidence number worth anything?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:12px;">Is the confidence score meaningful?</div>';
+  html += '<div class="event-line" style="border-left-color:#e8c37a;">' + cal.verdict + '</div>';
+  if (cal.discrimination != null) {
+    html += '<div class="zone-item"><span>High-confidence half vs low-confidence half</span><span class="mono ' + rClass(cal.discrimination) + '">'
+      + (cal.discrimination >= 0 ? '+' : '') + (cal.discrimination * 100).toFixed(0) + ' pp win rate</span></div>';
+  }
+  if (cal.buckets.length) {
+    html += '<table class="factor-table"><tr><th style="text-align:left;color:#5c6270;font-weight:500;">Confidence band</th><th style="color:#5c6270;font-weight:500;">Win rate</th><th style="color:#5c6270;font-weight:500;">Expectancy</th></tr>';
+    html += cal.buckets.map(b =>
+      '<tr><td>' + b.lo + '–' + b.hi + '% <span style="color:#454a56;">(' + b.n + ')</span></td>'
+      + '<td>' + fmtPct(b.winRate) + '</td>'
+      + '<td class="' + rClass(b.expectancyR) + '">' + fmtR(b.expectancyR) + '</td></tr>').join('');
+    html += '</table>';
+  }
+
+  // 2. Where does the edge actually live?
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">Where the edge actually lives</div>';
+  html += '<div style="font-size:10px;color:#454a56;margin-bottom:6px;">By session</div>' + rows(bd.bySession, 'Session');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By market regime</div>' + rows(bd.byRegime, 'Regime');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By grade</div>' + rows(bd.byGrade, 'Grade');
+  html += '<div style="font-size:10px;color:#454a56;margin:8px 0 6px;">By direction</div>' + rows(bd.byDirection, 'Direction');
+
+  // 3. The roads not taken.
+  html += '<div class="panel-title" style="font-size:11px;margin-top:14px;">The setups it turned down</div>';
+  html += '<div class="data-source-note" style="margin-bottom:6px;">Every setup the filter rejected is tracked and resolved against real price anyway. This is the comparison a human journal can never make, because nobody records their non-trades.</div>';
+  html += '<div class="zone-item"><span>Taken</span><span class="mono ' + rClass(audit.taken.expectancyR) + '">'
+    + fmtR(audit.taken.expectancyR) + ' <span style="color:#454a56;">(' + audit.taken.n + ')</span></span></div>';
+  html += '<div class="zone-item"><span>Declined</span><span class="mono ' + rClass(audit.declined.expectancyR) + '">'
+    + fmtR(audit.declined.expectancyR) + ' <span style="color:#454a56;">(' + audit.declined.n + ')</span></span></div>';
+  const pending = shadowLog.filter(s => s.status === 'pending' || s.status === 'open').length;
+  if (pending) html += '<div class="zone-item"><span>Declined, still running</span><span class="mono">' + pending + '</span></div>';
+  html += '<div class="event-line" style="border-left-color:#c99bff;margin-top:6px;">' + audit.verdict + '</div>';
+
+  root.innerHTML = html;
+}
+document.getElementById('resetQuality').addEventListener('click', async () => {
+  shadowLog = [];
+  await saveShadowLog();
+  renderAnalysisQuality();
+});
+
+// ============================================================
+// AUTONOMOUS MODE
+// ------------------------------------------------------------
+// The unattended operator. Once the user ticks the box, a single heartbeat
+// drives everything: fetch fresh candles, grade any signal that has since hit
+// its stop or target, re-analyse, commit a new signal if the gate clears, and
+// periodically re-backtest and retrain on the record it has built.
+//
+// Three things make this survive real-world conditions rather than only a tab
+// left open on a desk:
+//   * One 60s heartbeat with due-time checks, not a pile of setIntervals. A
+//     laptop that sleeps for six hours wakes up, sees every task is overdue,
+//     and runs them once — rather than firing a backlog of missed timers.
+//   * Losing the connection is expected, not exceptional. Offline is a quiet
+//     pause; repeated failures back off exponentially instead of hammering a
+//     rate-limited provider until the key is blocked.
+//   * Time with the tab closed is recovered, not lost. catchUp() replays the
+//     gap from real candle history on the next load, so signals that resolved
+//     while nobody was watching still become training data.
+// ============================================================
+
+const AUTONOMY_KEY = 'smc-autonomy-v1';
+const AUTONOMY_HEARTBEAT_MS = 60 * 1000;
+
+let autonomyHandle = null;
+let autonomyBusy = false;
+
+function autonomyConfig() {
+  const num = (id, fallback) => {
+    const el = document.getElementById(id);
+    const v = el ? parseFloat(el.value) : NaN;
+    return isFinite(v) ? v : fallback;
+  };
+  return Object.assign({}, AUTONOMY_DEFAULTS, {
+    minConfidence: num('aMinConf', AUTONOMY_DEFAULTS.minConfidence),
+    cooldownMinutes: num('aCooldown', AUTONOMY_DEFAULTS.cooldownMinutes),
+    maxOpenSignals: num('aMaxOpen', AUTONOMY_DEFAULTS.maxOpenSignals),
+    analysisIntervalMinutes: num('aInterval', AUTONOMY_DEFAULTS.analysisIntervalMinutes),
+    backtestIntervalHours: num('aBtHours', AUTONOMY_DEFAULTS.backtestIntervalHours),
+    minMetaScore: num('aMinMeta', AUTONOMY_DEFAULTS.minMetaScore),
+    // Kill switch. 0 in any field disables that arm rather than expiring
+    // everything instantly, which is what a 0 limit would otherwise mean.
+    maxHoursToFill: num('aKillFill', AUTONOMY_DEFAULTS.maxHoursToFill),
+    maxHoursOpen: num('aKillOpen', AUTONOMY_DEFAULTS.maxHoursOpen),
+    maxDriftRToFill: num('aKillDrift', AUTONOMY_DEFAULTS.maxDriftRToFill),
+    partialTP: partialTPConfig(),
+    newsState: currentNewsState(),
+    gradeFloor: (document.getElementById('aMinGrade') || {}).value || AUTONOMY_DEFAULTS.gradeFloor
+  });
+}
+
+function saveAutonomyState() {
+  try {
+    localStorage.setItem(AUTONOMY_KEY, JSON.stringify({
+      enabled: autonomy.enabled,
+      cycles: autonomy.cycles,
+      gateTally: autonomy.gateTally,
+      signalsTaken: autonomy.signalsTaken,
+      autoResolved: autonomy.autoResolved,
+      lastAnalysisAt: autonomy.lastAnalysisAt,
+      lastBacktestAt: autonomy.lastBacktestAt,
+      lastSignalAt: autonomy.lastSignalAt,
+      cfg: {
+        aMinConf: document.getElementById('aMinConf').value,
+        aCooldown: document.getElementById('aCooldown').value,
+        aKillFill: document.getElementById('aKillFill').value,
+        aKillOpen: document.getElementById('aKillOpen').value,
+        aKillDrift: document.getElementById('aKillDrift').value,
+        aMaxOpen: document.getElementById('aMaxOpen').value,
+        aInterval: document.getElementById('aInterval').value,
+        aBtHours: document.getElementById('aBtHours').value,
+        aMinMeta: document.getElementById('aMinMeta').value,
+        aDailyCap: document.getElementById('aDailyCap').value,
+        aMinGrade: document.getElementById('aMinGrade').value
+      }
+    }));
+  } catch (e) { /* storage unavailable — autonomy still works, it just won't remember across reloads */ }
+}
+
+function loadAutonomyState() {
+  try {
+    const raw = localStorage.getItem(AUTONOMY_KEY);
+    if (!raw) return;
+    const saved = JSON.parse(raw);
+    Object.assign(autonomy, {
+      enabled: !!saved.enabled,
+      cycles: saved.cycles || 0,
+      gateTally: saved.gateTally || {},
+      signalsTaken: saved.signalsTaken || 0,
+      autoResolved: saved.autoResolved || 0,
+      lastAnalysisAt: saved.lastAnalysisAt || null,
+      lastBacktestAt: saved.lastBacktestAt || null,
+      lastSignalAt: saved.lastSignalAt || null
+    });
+    if (saved.cfg) {
+      Object.keys(saved.cfg).forEach(id => {
+        const el = document.getElementById(id);
+        if (el && saved.cfg[id] != null) el.value = saved.cfg[id];
+      });
+    }
+    document.getElementById('autonomyEnabled').checked = autonomy.enabled;
+  } catch (e) { /* nothing saved yet */ }
+}
+
+function setAutonomyStatus(text, tone, reason) {
+  const dot = document.getElementById('autonomyDot');
+  const status = document.getElementById('autonomyStatus');
+  const reasonEl = document.getElementById('autonomyReason');
+  if (!status) return;
+  status.textContent = text;
+  const colours = { live: '#3ecf8e', warn: '#ffa726', error: '#ef4d5f', idle: '#454a56' };
+  const c = colours[tone] || colours.idle;
+  dot.style.background = c;
+  dot.style.boxShadow = tone === 'live' ? '0 0 7px ' + c : 'none';
+  status.style.color = tone === 'idle' ? '#9298a5' : c;
+  if (reason !== undefined) reasonEl.textContent = reason || '';
+}
+
+function renderAutonomyStats() {
+  const live = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  document.getElementById('aCycles').textContent = autonomy.cycles;
+  document.getElementById('aSignals').textContent = autonomy.signalsTaken;
+  document.getElementById('aResolved').textContent = autonomy.autoResolved;
+  document.getElementById('aOpen').textContent = live.length;
+
+  const killedEl = document.getElementById('aKilled');
+  if (killedEl) killedEl.textContent = signalLog.filter(s => s.status === 'expired').length;
+
+  // How long the oldest live trade has been sitting. This is the number that
+  // was invisible before: an order resting for a day looked identical to one
+  // placed a minute ago.
+  const oldestEl = document.getElementById('aOldest');
+  if (oldestEl) {
+    const cfg = autonomyConfig();
+    // Each trade is aged against the limit that actually applies to it: a
+    // resting order against the fill limit, a filled one against the hold
+    // limit. Using the larger of the two would leave an order 2.5x past its own
+    // deadline showing no warning at all.
+    const ages = live.map(s => {
+      const filled = s.status === 'open';
+      const t = Date.parse(filled ? (s.filledAt || s.time) : s.time);
+      if (!isFinite(t)) return null;
+      const hours = (Date.now() - t) / 3600000;
+      const limit = filled ? cfg.maxHoursOpen : cfg.maxHoursToFill;
+      return { hours, ratio: limit > 0 ? hours / limit : 0 };
+    }).filter(v => v != null);
+    if (!ages.length) {
+      oldestEl.textContent = '—';
+      oldestEl.style.color = '';
+    } else {
+      const worst = ages.reduce((a, b) => b.hours > a.hours ? b : a, ages[0]);
+      const closest = ages.reduce((a, b) => b.ratio > a.ratio ? b : a, ages[0]);
+      oldestEl.textContent = worst.hours < 1 ? Math.round(worst.hours * 60) + 'm' : worst.hours.toFixed(1) + 'h';
+      // Amber as a trade approaches its own kill limit, red once past it, so
+      // one about to be culled is visible before it disappears.
+      oldestEl.style.color = closest.ratio >= 1 ? '#ef4d5f' : closest.ratio >= 0.75 ? '#ffa726' : '';
+    }
+  }
+
+  const el = document.getElementById('gateTally');
+  if (!el) return;
+  const entries = Object.keys(autonomy.gateTally || {})
+    .map(k => ({ code: k, n: autonomy.gateTally[k] }))
+    .sort((a, b) => b.n - a.n);
+  if (!entries.length) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div style="font-size:10px;color:#454a56;margin:8px 0 4px;">Why cycles ended this way</div>'
+    + entries.map(e => '<div class="zone-item" style="padding:3px 0;"><span style="font-size:11px;">'
+        + (GATE_LABELS[e.code] || e.code) + '</span><span class="mono" style="font-size:11px;color:'
+        + (e.code === 'taken' ? '#3ecf8e' : '#5c6270') + ';">' + e.n + '</span></div>').join('');
+}
+
+// Grade every unresolved signal against `candles`. Used both by the heartbeat
+// (fresh candles each cycle) and by catchUp() (deep history after downtime).
+// Returns how many signals reached a win/loss verdict.
+function resolveOpenSignals(candles, cfg) {
+  if (!candles || candles.length < 2) return 0;
+  let resolved = 0, killed = 0, changed = false;
+
+  // The auditor decides which live trades are past saving, not the engine.
+  // Letting the engine judge whether its own trade has gone bad is the thing
+  // the auditor exists to avoid — and it re-derives fill state from raw candles
+  // rather than trusting the signal's own status, so a "pending" order price
+  // actually traded through is caught rather than aged as if it never filled.
+  const tradeAudit = auditOpenTrades(signalLog, candles, {
+    maxHoursToFill: cfg.maxHoursToFill,
+    maxHoursOpen: cfg.maxHoursOpen,
+    maxDriftRToFill: cfg.maxDriftRToFill
+  });
+  lastTradeAudit = tradeAudit;
+  const killedBy = new Map(tradeAudit.kills.map(k => [k.id, k]));
+
+  signalLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    // An auditor kill outranks whatever the resolver would have said, EXCEPT
+    // when price has already settled the trade: a stop or target that has
+    // genuinely been hit is a real outcome and real evidence, and discarding it
+    // to enforce a time limit would throw away the data the limit exists to
+    // protect.
+    const verdict = resolveSignal(sig, candles, cfg);
+    const kill = killedBy.get(sig.id);
+    if (kill && verdict.status !== 'won' && verdict.status !== 'lost') {
+      sig.status = 'expired';
+      sig.expiryReason = 'auditor: ' + kill.reason;
+      sig.killSwitch = kill.code;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auditor';
+      paperCloseForSignal(sig.id, 'expired');
+      killed++; changed = true;
+      return;
+    }
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      if (applySignalOutcome(sig, verdict.status === 'won', {
+        auto: true, exitPrice: verdict.exitPrice, ambiguousBar: verdict.ambiguousBar, partial: verdict.partial
+      })) { resolved++; changed = true; }
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired';
+      sig.expiryReason = verdict.reason || null;
+      sig.killSwitch = verdict.killSwitch || null;
+      sig.resolvedAt = new Date().toISOString();
+      sig.resolvedBy = 'auto';
+      paperCloseForSignal(sig.id, 'expired');
+      if (verdict.killSwitch) killed++;
+      changed = true; // expired signals never become training data — no outcome to learn from
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; // limit entry got tagged; it's a live position now
+      sig.filledAt = new Date().toISOString();
+      paperFillForSignal(sig.id, sig.filledAt);
+      changed = true;
+    }
+  });
+  if (changed) { saveSignalLog(); renderSignalLog(); }
+  if (resolved) autonomy.autoResolved += resolved;
+  if (killed) autonomy.killed = (autonomy.killed || 0) + killed;
+  resolveShadowSignals(candles, cfg);
+  return resolved;
+}
+
+// Shadows get the same treatment, minus the learning updates — a setup the
+// engine declined should inform the audit, not train the weights as though it
+// had been traded.
+function resolveShadowSignals(candles, cfg) {
+  if (!candles || candles.length < 2 || !shadowLog.length) return;
+  let changed = false;
+  shadowLog.forEach(sig => {
+    if (sig.status !== 'pending' && sig.status !== 'open') return;
+    const verdict = resolveSignal(sig, candles, cfg);
+    if (verdict.status === 'won' || verdict.status === 'lost') {
+      sig.status = verdict.status;
+      sig.resolvedAt = new Date().toISOString();
+      changed = true;
+    } else if (verdict.status === 'expired') {
+      sig.status = 'expired'; sig.expiryReason = verdict.reason || null; changed = true;
+    } else if (verdict.status === 'open' && sig.status === 'pending') {
+      sig.status = 'open'; changed = true;
+    }
+  });
+  if (changed) { saveShadowLog(); renderAnalysisQuality(); }
+}
+
+// One unattended pass. Everything that can fail is inside the caller's try.
+async function autonomyCycle() {
+  const cfg = autonomyConfig();
+  const now = Date.now();
+
+  // 0. Calendar first. It gates whether a signal may be taken at all, so it has
+  // to be current BEFORE the gate reads it — refreshing at the end of the cycle
+  // meant the first pass after a reconnect ran against an empty calendar and
+  // could take a position straight into a release window.
+  await refreshCalendar(false);
+
+  // 1. Fresh candles. resyncCandles() already refreshes liveData from the provider.
+  await resyncCandles();
+
+  // 2. Grade what the market has already decided since the last pass.
+  const graded = resolveOpenSignals(liveData, cfg);
+
+  // 3. Re-analyse on the new data.
+  refreshAll();
+  autonomy.lastAnalysisAt = now;
+
+  // 4. Commit a signal only if the gate clears.
+  let reason;
+  if (lastComposite) {
+    const plan = buildTradePlan(lastComposite, getTargetRR());
+    // The auditor is advisory everywhere except here. A critical finding means
+    // the analysis contradicts itself or the data it was built on — that is not
+    // a risk preference, and no confidence score should be able to override it.
+    const audit = runAudit();
+    renderAudit();
+    let gate;
+    if (audit && audit.blocking) {
+      gate = { take: false, code: 'audit',
+        reason: 'independent audit found ' + audit.critical + ' critical issue(s): ' + audit.findings[0].title };
+    } else {
+      gate = autonomyGate(lastComposite, plan, signalLog, autonomy.lastSignalAt, cfg);
+    }
+    // Tally why each cycle ended as it did. One latest-reason line cannot show
+    // whether 13 quiet cycles mean "no setup existed" or "the filter blocked
+    // every one" — and those need opposite responses.
+    const code = gate.code || 'unknown';
+    autonomy.gateTally[code] = (autonomy.gateTally[code] || 0) + 1;
+    if (gate.take) {
+      updateSignalUI(lastComposite, plan, true, 'auto'); // logIt = true -> addSignalToLog
+      autonomy.signalsTaken++;
+      autonomy.lastSignalAt = now;
+      reason = 'Took a ' + lastComposite.direction + ' at $' + fmt(plan.entry) +
+               ' (' + lastComposite.confidence + '% confidence' + (gate.grade ? ', grade ' + gate.grade : '') + ').';
+    } else {
+      updateSignalUI(lastComposite, plan, false); // keep the panel current without logging
+      // Track what was passed on, so the filter can be audited later rather
+      // than trusted forever.
+      addShadowSignal(lastComposite, plan, gate.reason);
+      reason = 'No signal taken — ' + gate.reason + '.';
+    }
+  } else {
+    reason = 'Analysis produced no result this cycle.';
+  }
+  if (graded) reason = 'Self-graded ' + graded + ' signal' + (graded === 1 ? '' : 's') + '. ' + reason;
+  autonomy.lastReason = reason;
+
+  // 5. Periodic re-backtest / retrain on the accumulated record.
+  const btDue = !autonomy.lastBacktestAt || (now - autonomy.lastBacktestAt) >= cfg.backtestIntervalHours * 3600 * 1000;
+  if (btDue) {
+    autonomy.lastBacktestAt = now;
+    await runBacktestCycle(true);
+  }
+
+  renderAnalysisQuality();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  runAudit();
+  renderAudit();
+  autonomy.cycles++;
+  autonomy.consecutiveErrors = 0;
+  autonomy.lastError = null;
+  saveAutonomyState();
+  renderAutonomyStats();
+  if (candlesStaleForBudget) {
+    setAutonomyStatus('Running on cached candles — daily API budget spent, resumes 00:00 UTC.', 'warn',
+      'Still grading open signals and re-analysing, but on the last candles fetched rather than fresh ones. ' + reason);
+  } else {
+    setAutonomyStatus('Running autonomously — last pass ' + new Date(now).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', 'live', reason);
+  }
+}
+
+// The heartbeat: decides whether a cycle is due, and handles every reason it
+// might not be. Deliberately does no analysis itself.
+async function autonomyHeartbeat() {
+  if (!autonomy.enabled || autonomyBusy) return;
+
+  if (!navigator.onLine) {
+    setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn',
+      'Nothing is lost while offline; the gap gets replayed from candle history once the connection is back.');
+    return;
+  }
+  if (dataMode !== 'live') {
+    setAutonomyStatus('Waiting for a live data provider — connect an API key above.', 'warn',
+      'Autonomous mode needs real candles; it will not run on the simulated feed.');
+    return;
+  }
+  // Gold is shut from Friday ~21:00 UTC to Sunday ~22:00 UTC. Analysing a frozen
+  // feed produces confident-looking signals off Friday's last bar, and every one
+  // of them enters the learning record as a real read of a market that was not
+  // trading. Nothing to analyse, so nothing runs.
+  if (!isMarketOpen(Date.now())) {
+    const clock = marketClock(Date.now());
+    const h = clock.hoursUntilOpen;
+    setAutonomyStatus('Market closed — resumes when gold reopens in ' +
+      (h < 1 ? Math.round(h * 60) + 'm' : h.toFixed(1) + 'h') + '.', 'warn',
+      'The feed is frozen at Friday\u2019s close. Analysing it would generate signals from a market that is not trading.');
+    return;
+  }
+  if (autonomy.skipCycles > 0) {
+    autonomy.skipCycles--;
+    setAutonomyStatus('Backing off after an error — retrying in ' + (autonomy.skipCycles + 1) + ' min.', 'warn', autonomy.lastError);
+    return;
+  }
+
+  const cfg = autonomyConfig();
+  const dueAt = (autonomy.lastAnalysisAt || 0) + cfg.analysisIntervalMinutes * 60 * 1000;
+  if (Date.now() < dueAt) {
+    const mins = Math.ceil((dueAt - Date.now()) / 60000);
+    setAutonomyStatus('Running autonomously — next pass in ' + mins + ' min.', 'live', autonomy.lastReason);
+    return;
+  }
+
+  autonomyBusy = true;
+  try {
+    await autonomyCycle();
+  } catch (e) {
+    autonomy.consecutiveErrors++;
+    autonomy.lastError = (e && e.message) || String(e);
+    // Exponential backoff, capped at ~30 min. A rate-limited or expired key
+    // should not turn into a request every minute for the rest of the day.
+    autonomy.skipCycles = Math.min(Math.pow(2, autonomy.consecutiveErrors), 30);
+    setAutonomyStatus('Cycle failed (' + autonomy.consecutiveErrors + ' in a row) — backing off ' + autonomy.skipCycles + ' min.', 'error', autonomy.lastError);
+    saveAutonomyState();
+  } finally {
+    autonomyBusy = false;
+  }
+}
+
+// Replay the time the app was closed or disconnected. Pulls the deepest history
+// the provider allows and grades every still-open signal against it, so a signal
+// that hit its target overnight is training data by the time the user looks.
+async function autonomyCatchUp() {
+  if (dataMode !== 'live' || !navigator.onLine) return;
+  const stillOpen = signalLog.filter(s => s.status === 'pending' || s.status === 'open');
+  if (!stillOpen.length) return;
+  setAutonomyStatus('Catching up — replaying ' + stillOpen.length + ' unresolved signal(s) against real history…', 'warn', '');
+  try {
+    const history = await PROVIDERS[activeProvider].timeSeries(apiKey, LIVE_INTERVAL, 5000);
+    const n = resolveOpenSignals(history, autonomyConfig());
+    renderAutonomyStats();
+    saveAutonomyState();
+    setAutonomyStatus('Catch-up complete.', autonomy.enabled ? 'live' : 'idle',
+      n ? 'Graded ' + n + ' signal(s) that resolved while the app was closed.'
+        : 'No signals had resolved while the app was closed.');
+  } catch (e) {
+    // Not fatal — the regular heartbeat will keep trying against live candles.
+    setAutonomyStatus('Catch-up could not fetch history — continuing on live candles.', 'warn', (e && e.message) || String(e));
+  }
+}
+
+function startAutonomy() {
+  if (autonomyHandle) clearInterval(autonomyHandle);
+  autonomyHandle = setInterval(autonomyHeartbeat, AUTONOMY_HEARTBEAT_MS);
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Autonomous mode on — first pass starting…', 'live', '');
+  autonomy.lastAnalysisAt = null; // force an immediate first pass
+  autonomyHeartbeat();
+}
+
+function stopAutonomy() {
+  if (autonomyHandle) { clearInterval(autonomyHandle); autonomyHandle = null; }
+  setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+}
+
+document.getElementById('autonomyEnabled').addEventListener('change', function () {
+  autonomy.enabled = this.checked;
+  saveAutonomyState();
+  if (autonomy.enabled) startAutonomy(); else stopAutonomy();
+});
+providerSelect.addEventListener('change', renderQuota);
+const umm = document.getElementById('useMacroModel');
+if (umm) umm.addEventListener('change', () => { renderKnowledge(); renderReasoning(); });
+
+// A posture for building up a record rather than protecting capital. The engine
+// learns from resolved trades, and at the default B floor a ranging market
+// simply never qualifies — so a cautious setup collects nothing and the
+// knowledge base never starts.
+document.getElementById('aPresetCollect').addEventListener('click', () => {
+  // D, not C: even a perfect five-timeframe alignment only scores ~49%, so a C
+  // floor (>=30%) still rejects ordinary conditions and collects almost nothing.
+  document.getElementById('aMinGrade').value = 'D';
+  document.getElementById('aMinConf').value = 15;
+  document.getElementById('aCooldown').value = 30;
+  document.getElementById('aMaxOpen').value = 5;
+  document.getElementById('aMinMeta').value = -0.5;
+  saveAutonomyState();
+  autonomy.lastAnalysisAt = null; // re-evaluate immediately under the new thresholds
+  setAutonomyStatus('Data-collection thresholds applied — re-evaluating now.', 'live', '');
+  autonomyHeartbeat();
+});
+document.getElementById('autonomyAdvancedToggle').addEventListener('click', () => {
+  document.getElementById('autonomyAdvanced').classList.toggle('hidden');
+});
+['aMinConf', 'aCooldown', 'aMaxOpen', 'aInterval', 'aBtHours', 'aMinMeta', 'aDailyCap', 'aMinGrade',
+ 'aKillFill', 'aKillOpen', 'aKillDrift'].forEach(id => {
+  const el = document.getElementById(id);
+  if (el) el.addEventListener('change', () => { saveAutonomyState(); renderQuota(); });
+});
+
+// React to connectivity changes straight away rather than waiting out a heartbeat.
+window.addEventListener('online', () => {
+  if (!autonomy.enabled) return;
+  autonomy.skipCycles = 0;
+  autonomy.consecutiveErrors = 0;
+  setAutonomyStatus('Back online — catching up…', 'warn', '');
+  autonomyCatchUp().then(autonomyHeartbeat);
+});
+window.addEventListener('offline', () => {
+  if (autonomy.enabled) setAutonomyStatus('Paused — no internet connection. Resumes automatically.', 'warn', '');
+});
+// Coming back to a backgrounded tab is a good moment to check for missed work:
+// mobile browsers in particular throttle timers hard once a tab is hidden.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && autonomy.enabled) autonomyHeartbeat();
+});
+
+// ============================================================
+// BOOTSTRAP
+// ------------------------------------------------------------
+// Ordering matters here, which is why it is one explicit sequence rather than
+// scattered top-level calls: persisted learning state has to be restored (and
+// its weights applied) before the first analysis, and every DOM const further
+// up this file has to exist before anything reads it.
+// ============================================================
+// ============================================================
+// SETTINGS THAT SURVIVE A RELOAD
+// ------------------------------------------------------------
+// Only the paper account's balance and the autonomy thresholds were ever
+// persisted. Everything else a person could change — risk per trade, spread,
+// slippage, max concurrent, the partial-take-profit rules, all fourteen factor
+// weights, the target R:R, every backtest parameter, the news-window settings —
+// was read straight off the DOM and lost the moment the page reloaded. Tuning
+// the system was therefore something you had to redo from memory each session,
+// and an autonomous run would quietly revert to defaults after any refresh.
+//
+// One store, one list, restored before the first analysis so the weights are in
+// force when it runs. Ids that already have an owner are deliberately absent —
+// autonomy keeps its own (AUTONOMY_KEY), the paper on/off switches live with the
+// account, and the API keys are opt-in through "remember keys" rather than
+// swept up here.
+const SETTINGS_KEY = 'smc-settings-v1';
+const SETTINGS_IDS = [
+  // paper account
+  'pStartBalance', 'pRiskPct', 'pSpread', 'pSlippage', 'pMaxPos',
+  'pSizingMode', 'pFixedLots', 'pContractSize', 'pLotStep', 'pMinLots',
+  'pPartialPct', 'pHoldMeta', 'pPartialEnabled',
+  // factor weights
+  'wWeekly', 'wDaily', 'wHtf', 'wMtf', 'wLtf', 'wOb', 'wFvg', 'wLiq',
+  'wPd', 'wPriceAction', 'wClassic', 'wCorrelation', 'wFundamental', 'wNews',
+  // signal + backtest
+  'targetRR', 'pBars', 'pCapital', 'pRisk', 'pCostPips', 'pMinConf', 'pTargetRR',
+  // news window and macro model
+  'newsBeforeMin', 'newsAfterMin', 'newsBlockEnabled', 'newsBlockMedium',
+  'newsFlattenEnabled', 'newsFlattenMin', 'newsAlertMin', 'useMacroModel',
+  'weekendFlattenEnabled', 'weekendFlattenMin'
+];
+
+function saveSettings() {
+  const out = {};
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    out[id] = el.type === 'checkbox' ? !!el.checked : el.value;
+  });
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(out)); }
+  catch (e) { return false; }
+  return true;
+}
+
+function loadSettings() {
+  let saved;
+  try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY) || 'null'); }
+  catch (e) { return; }
+  if (!saved || typeof saved !== 'object') return;
+  SETTINGS_IDS.forEach(id => {
+    if (!(id in saved)) return;
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.type === 'checkbox') el.checked = !!saved[id];
+    else if (saved[id] != null) el.value = saved[id];
+  });
+  // Sliders carry a printed value beside them that does not follow a
+  // programmatic change, so a restored weight would show the old number.
+  syncSliderLabels();
+}
+
+function syncSliderLabels() {
+  weightIds.forEach(id => {
+    const el = document.getElementById(id), out = document.getElementById(id + 'V');
+    if (el && out) out.textContent = el.value;
+  });
+  const rr = document.getElementById('targetRR'), rrOut = document.getElementById('targetRRV');
+  if (rr && rrOut) rrOut.textContent = '1:' + rr.value;
+}
+
+let settingsSaveTimer = null;
+function flagSettingsSaved() {
+  const el = document.getElementById('settingsSavedNote');
+  if (!el) return;
+  el.textContent = 'Settings saved.';
+  el.style.color = '#3ecf8e';
+  clearTimeout(settingsSaveTimer);
+  settingsSaveTimer = setTimeout(() => { el.textContent = ''; }, 2500);
+}
+
+function wireSettingsPersistence() {
+  SETTINGS_IDS.forEach(id => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const handler = () => { if (saveSettings()) flagSettingsSaved(); };
+    el.addEventListener('change', handler);
+    // Sliders and number spinners fire `input` continuously; `change` alone
+    // would miss a drag that never blurs.
+    if (el.type === 'range' || el.type === 'number') el.addEventListener('input', handler);
+  });
+}
+
+// ============================================================
+// IS THIS TAB STILL RUNNING THE CURRENT CODE?
+// ------------------------------------------------------------
+// This app is built to be left open for days doing unattended analysis, which
+// means a tab can go on running the modules it loaded at open time long after a
+// fix has shipped. That is not hypothetical: the macro engine ran on 1976-2006
+// FRED data, the fix deployed, and an open tab would have carried on producing
+// confident, wrong numbers with nothing on screen to say so.
+//
+// The check compares the ETag of app.js now against the one seen at startup, so
+// it needs no version constant to keep in sync and no build step. `no-store`
+// forces the request past the browser cache; the server already sends
+// must-revalidate, so this is cheap.
+const UPDATE_CHECK_MS = 30 * 60 * 1000;
+let loadedBuildTag = null;
+let updateWatchHandle = null;
+
+async function currentBuildTag() {
+  try {
+    const r = await fetch('app.js', { method: 'HEAD', cache: 'no-store' });
+    return r.headers.get('etag') || r.headers.get('last-modified') || null;
+  } catch (e) {
+    return null; // offline, or the check is blocked — try again next time
+  }
+}
+
+async function checkForNewBuild() {
+  const tag = await currentBuildTag();
+  if (!tag) return;
+  if (loadedBuildTag == null) { loadedBuildTag = tag; return; }
+  if (tag === loadedBuildTag) return;
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.classList.remove('hidden');
+}
+
+function startUpdateWatch() {
+  const reload = document.getElementById('updateReload');
+  if (reload) reload.addEventListener('click', () => window.location.reload());
+  checkForNewBuild();
+  if (updateWatchHandle) clearInterval(updateWatchHandle);
+  updateWatchHandle = setInterval(checkForNewBuild, UPDATE_CHECK_MS);
+}
+
+async function bootstrap() {
+  // Before anything reads a control: the weights, risk settings and thresholds
+  // have to be the saved ones by the time the first analysis runs.
+  loadSettings();
+  wireSettingsPersistence();
+  await loadLearningState();
+  await loadSignalLog();
+  await loadShadowLog();
+  applyKnowledgeBaseWeights();
+  await loadPaper();
+  await loadKnowledge();
+  await loadCalendarCache();
+  loadAutonomyState();
+  loadQuota();
+  // Every store the merge touches is loaded by this point — the log it merges
+  // into, the paper account it books positions in, the learning state it
+  // updates. Replay anything the worker sent while that was still loading.
+  flushPendingIngest();
+  renderSignalLog();   // first render happened before the paper account loaded
+  startLivenessTicker();
+  startUpdateWatch();
+  startNewsWatch();
+  renderQuota();
+  renderAutonomyStats();
+  renderAnalysisQuality();
+  renderPaper();
+  renderDataInventory();
+  renderCalendar();
+  renderReasoning();
+  renderKnowledge();
+  runAudit();
+  renderAudit();
+  refreshWorkerTotals().then(renderDataInventory);
+  refreshAll();
+
+  const saved = await loadSavedKeys();
+  if (!saved) {
+    document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+  } else {
+    document.getElementById('rememberKeysCheckbox').checked = true;
+    if (saved.provider) providerSelect.value = saved.provider;
+    if (saved.fredKey) document.getElementById('fredKeyInput').value = saved.fredKey;
+    if (saved.newsKey) document.getElementById('newsKeyInput').value = saved.newsKey;
+    if (typeof saved.autoBacktest === 'boolean') document.getElementById('autoBacktestCheckbox').checked = saved.autoBacktest;
+    if (saved.apiKey) {
+      document.getElementById('apiKeyInput').value = saved.apiKey;
+      connStatus.textContent = 'Restoring saved connection...';
+      await connectProvider(); // also re-fetches correlation/fundamentals/news with the restored keys
+    } else if (saved.fredKey || saved.newsKey) {
+      // No price provider was connected, but FRED/news keys were saved independently — restore those engines too.
+      await refreshCorrelation(activeProvider, apiKey, saved.fredKey || '');
+      await refreshFundamentals(saved.fredKey || '');
+      await refreshNewsSentiment(saved.newsKey || '');
+      refreshAll();
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    } else {
+      document.getElementById('autoBacktestStatus').textContent = 'Connect a data provider to enable auto-backtesting.';
+    }
+  }
+
+  // The calendar gates trading, so it must be loaded before autonomy's first pass.
+  await refreshCalendar(false);
+  renderCalendar();
+  renderReasoning();
+
+  // Recover anything that resolved while the app was closed, then pick the loop back up.
+  if (autonomy.enabled) {
+    await autonomyCatchUp();
+    startAutonomy();
+  } else {
+    setAutonomyStatus('Off — check the box above to start.', 'idle', '');
+  }
+}
+bootstrap();

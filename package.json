@@ -1,0 +1,19 @@
+{
+  "name": "xauusd-smart-trader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "XAUUSD smart-money analysis dashboard with autonomous self-backtesting",
+  "scripts": {
+    "test": "node test/run-all.mjs unit",
+    "test:browser": "node test/run-all.mjs browser",
+    "test:all": "node test/run-all.mjs",
+    "test:week": "node test/run-week.mjs unit"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
